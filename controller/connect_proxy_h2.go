@@ -21,6 +21,8 @@ import (
 
 const (
 	http2ConnectIdleTimeout         = 90 * time.Second
+	http2ConnectReadIdleTimeout     = 15 * time.Second
+	http2ConnectPingTimeout         = 10 * time.Second
 	http2ConnectTLSHandshakeTimeout = 3 * time.Second
 	http2ConnectMaxResponseHeaders  = 16 << 10
 )
@@ -117,7 +119,11 @@ func newHTTP2ConnectTransport(key http2ConnectTransportKey) *xhttp2.Transport {
 		},
 		DisableCompression: true,
 		IdleConnTimeout:    http2ConnectIdleTimeout,
-		MaxHeaderListSize:  http2ConnectMaxResponseHeaders,
+		// Probe the physical H2 connection only after inbound frames stop.
+		// A lost PING closes its streams; later CONNECTs use a fresh connection.
+		ReadIdleTimeout:   http2ConnectReadIdleTimeout,
+		PingTimeout:       http2ConnectPingTimeout,
+		MaxHeaderListSize: http2ConnectMaxResponseHeaders,
 	}
 }
 

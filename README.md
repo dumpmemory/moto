@@ -249,6 +249,8 @@ SOCKS5 到 H3/H2 CONNECT 的完整规则已经整合到 [config/setting.json](co
 
 `protocols` 按配置顺序尝试。Moto 支持 H3/H2 连接复用、自动故障切换、持续退化冷却、数据面恢复验证和自适应选路；这些策略由程序内部管理，无需额外调节。Moto 始终校验证书与 `serverName`，上游拒绝也不会被误报为 SOCKS 成功。
 
+HTTP/2 使用保守的协议级 PING 健康检测，识别并释放失联连接，后续请求可重新建连。健康的空闲隧道不会仅因没有业务流量而被关闭；失效连接上的已有隧道需要客户端重新连接。
+
 SOCKS5 模式使用独立的协议连接管理，因此必须保持 `prewarm: false`，也不能与 `regex`、`tls`、HTTP health check 或 PROXY protocol 组合。Basic Auth 凭据存放在 JSON 中，应严格限制配置文件权限。Moto 会在启动前校验配置，无效配置不会投入运行。
 
 <details>

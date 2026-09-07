@@ -2157,10 +2157,19 @@ func TestRaceBoostTargetsRefillsFailedSlotBeforeSlowPeerCompletes(t *testing.T) 
 	var slowOnce sync.Once
 	var replacementOnce sync.Once
 
-	winner, err := raceBoostTargets(context.Background(), rule, func(ctx context.Context, addr string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	winner, err := raceBoostTargets(ctx, rule, func(ctx context.Context, addr string) (net.Conn, error) {
 		switch addr {
 		case "fast-fail:1":
-			return nil, errors.New("unavailable")
+			// Establish the slow initial peer before freeing the other slot.
+			// Otherwise a replacement can win before that peer is scheduled.
+			select {
+			case <-slowStarted:
+				return nil, errors.New("unavailable")
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 		case "slow:2":
 			slowOnce.Do(func() { close(slowStarted) })
 			<-ctx.Done()
