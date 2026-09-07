@@ -24,6 +24,8 @@ jobs:
         run: make fmt-check
       - name: Validate workflows
         run: make workflow-check
+      - name: Check release packaging
+        run: make release-check
       - name: Verify modules
         run: make mod-check
       - name: Test

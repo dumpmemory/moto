@@ -158,7 +158,8 @@ jobs:
               "${package}/packaging/moto.service" | LC_ALL=C sort)"
             test "${actual}" = "${expected}"
           done
-          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 8
+          python3 packaging/bundle_sbom.py dist "${GITHUB_REF_NAME}"
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 5
       - name: Generate checksums
         run: |
           set -euo pipefail
