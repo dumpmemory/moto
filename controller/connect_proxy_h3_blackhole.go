@@ -181,13 +181,15 @@ func (manager *connectProxyManager) retainActiveUDPBlackholeScopes(rule string, 
 	if len(scopes) == 0 && manager.h3RuleBreaker.udpBlackholeCommitMatches(rule, token) {
 		return true
 	}
-	active := scopes[:0]
+	// Keep the evaluated snapshot intact. A different blackhole notification
+	// may join while physical generations are checked under the H3 lock.
+	active := make([]http3UDPBlackholeScope, 0, len(scopes))
 	for _, scope := range scopes {
 		if manager.h3.http3BlackholeStillActive(scope) {
 			active = append(active, scope)
 		}
 	}
-	return manager.h3RuleBreaker.retainUDPBlackholeEvaluationScopes(rule, token, active)
+	return manager.h3RuleBreaker.retainUDPBlackholeEvaluationScopes(rule, token, scopes, active)
 }
 
 func (breaker *http3RuleBreaker) udpBlackholeCommitMatches(rule string, token uint64) bool {
@@ -421,6 +423,7 @@ func (breaker *http3RuleBreaker) udpBlackholeEvaluationScopes(
 func (breaker *http3RuleBreaker) retainUDPBlackholeEvaluationScopes(
 	rule string,
 	token uint64,
+	evaluated []http3UDPBlackholeScope,
 	active []http3UDPBlackholeScope,
 ) bool {
 	if breaker == nil || rule == "" || token == 0 {
@@ -432,8 +435,26 @@ func (breaker *http3RuleBreaker) retainUDPBlackholeEvaluationScopes(
 	if state == nil || state.phase != http3RuleBreakerEvaluating || state.evaluationToken != token {
 		return false
 	}
-	state.evaluationBlackholes = append(state.evaluationBlackholes[:0], active...)
-	if len(active) > 0 {
+	// Prune only members this snapshot proved stale. Replacing the current
+	// list with active would erase scopes joined after the snapshot; appending
+	// active would also resurrect scopes a concurrent check already removed.
+	// Exact scope identity includes the physical connection generation, so a
+	// stale result cannot remove a newly joined generation on the same slot.
+	stale := make(map[http3UDPBlackholeScope]struct{}, len(evaluated))
+	for _, scope := range evaluated {
+		stale[scope] = struct{}{}
+	}
+	for _, scope := range active {
+		delete(stale, scope)
+	}
+	retained := state.evaluationBlackholes[:0]
+	for _, scope := range state.evaluationBlackholes {
+		if _, remove := stale[scope]; !remove {
+			retained = append(retained, scope)
+		}
+	}
+	state.evaluationBlackholes = retained
+	if len(retained) > 0 {
 		return true
 	}
 	if state.evaluationInFlight > 0 {

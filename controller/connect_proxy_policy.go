@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"moto/config"
+	"net"
 )
 
 const connectProxyMaxTargetAttempts = 2
@@ -19,6 +20,96 @@ func connectProxyTargetAttemptLimit(rule *config.Rule) int {
 		return len(rule.Targets)
 	}
 	return connectProxyMaxTargetAttempts
+}
+
+// dialSequentialConnectProxyTargets bounds normal/round-robin SOCKS requests
+// by distinct admitted target attempts, not by locally rejected candidates.
+// The outbound start callback runs only after health, circuit, and dial-capacity
+// admission. Both protocols inside one target still consume a single attempt.
+func (runtime *routingRuntime) dialSequentialConnectProxyTargets(
+	ctx context.Context,
+	rule *config.Rule,
+	start int,
+) (net.Conn, routeAttempt, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if rule == nil || len(rule.Targets) == 0 {
+		return nil, routeAttempt{}, "", errors.New("CONNECT proxy has no targets")
+	}
+	var failures []error
+	lastAddress := ""
+	started := 0
+	limit := connectProxyTargetAttemptLimit(rule)
+	visited := make(map[string]struct{}, len(rule.Targets))
+	tryOnly := false
+	start %= len(rule.Targets)
+	if start < 0 {
+		start += len(rule.Targets)
+	}
+	for offset := 0; offset < len(rule.Targets) && started < limit; offset++ {
+		if err := ctx.Err(); err != nil {
+			failures = append(failures, err)
+			break
+		}
+		candidate := rule.Targets[(start+offset)%len(rule.Targets)]
+		if candidate == nil || candidate.Address == "" {
+			continue
+		}
+		if _, seen := visited[candidate.Address]; seen {
+			continue
+		}
+		visited[candidate.Address] = struct{}{}
+		lastAddress = candidate.Address
+		connection, attempt, err := runtime.outboundDialRouteWithOptions(
+			ctx, rule, candidate.Address, tryOnly, func() { started++ },
+		)
+		if err == nil {
+			return connection, attempt, candidate.Address, nil
+		}
+		failures = append(failures, err)
+		if isDialBulkheadError(err) {
+			if !isDialTargetBulkheadSaturation(err) {
+				break
+			}
+			// After one target exhausts the foreground wait budget, remaining
+			// candidates are opportunistic rather than starting another queue.
+			tryOnly = true
+		}
+	}
+	if len(failures) == 0 {
+		failures = append(failures, errors.New("CONNECT proxy has no usable targets"))
+	}
+	return nil, routeAttempt{}, lastAddress, errors.Join(failures...)
+}
+
+// Local admission/cancellation is not an upstream outage. Every component
+// must be local before lowering the final log level, so a later CONNECT HTTP
+// response retains its normal status-specific message and severity.
+func connectProxySequentialFailureIsLocal(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !connectProxySequentialFailureIsLocal(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if _, local := err.(*dialBulkheadError); local {
+		return true
+	}
+	if wrapped := errors.Unwrap(err); wrapped != nil {
+		return connectProxySequentialFailureIsLocal(wrapped)
+	}
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, ErrCircuitOpen) || errors.Is(err, ErrActiveHealthUnhealthy)
 }
 
 // connectProxyFinalStatusError selects one deterministic concrete HTTP status

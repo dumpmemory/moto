@@ -835,6 +835,16 @@ func (runtime *routingRuntime) raceBoostTargetsPreparedWithAdmissionAndRecovery(
 						finish(dialResult{addr: addr, err: ErrActiveHealthUnhealthy})
 						return
 					}
+					if candidate.recoveryProbe && candidate.protocolProbe.token != 0 &&
+						runtime.http3OnlyRecoveryRestricted(rule, target, time.Now()) {
+						// A rule-level H2 cooldown/probation may have started while
+						// this target waited for local capacity. Its old canary lease
+						// is not permission to bypass that newer protocol decision.
+						// Reject before routeBegin so no network attempt is counted.
+						releaseDial()
+						finish(dialResult{addr: addr, err: ErrCircuitOpen})
+						return
+					}
 					started := time.Now()
 					attempt, err := runtime.routes.begin(rule, addr, started)
 					if err != nil {
@@ -1105,11 +1115,31 @@ func (runtime *routingRuntime) boostRecoveryPolicy(
 	return excluded, penalties, hasUnpenalized
 }
 
+func targetUsesOnlyHTTP3(target *config.Target) bool {
+	return target != nil && target.ConnectProxy != nil && len(target.ConnectProxy.Protocols) == 1 &&
+		target.ConnectProxy.Protocols[0] == config.ConnectProxyH3
+}
+
+// http3OnlyRecoveryRestricted keeps target recovery subordinate to a live
+// rule-level H2 decision. If no unpenalized route can actually be used, preserve
+// the existing last-resort fail-open behavior instead of declaring the rule dead.
+func (runtime *routingRuntime) http3OnlyRecoveryRestricted(rule *config.Rule, target *config.Target, now time.Time) bool {
+	if !targetUsesOnlyHTTP3(target) || runtime.connectProxy == nil || runtime.connectProxy.h3RuleBreaker == nil ||
+		!runtime.connectProxy.h3RuleBreaker.restrictsOrdinaryH3(rule.Name, now) {
+		return false
+	}
+	if runtime.connectProxy.h3RuleBreaker.recoveryProbeDue(rule.Name, now) {
+		return true
+	}
+	_, _, hasUnpenalized := runtime.boostRecoveryPolicy(rule, now)
+	return hasUnpenalized
+}
+
 // claimBoostRecoveryProbe composes target-circuit recovery with protocol-level
-// H3 routing state. A penalized route cannot bypass an available unpenalized
-// H2-capable sibling, and a recovery that is also the due H3 probation carries
-// the protocol lease into the actual dial. If every available route is
-// penalized, retain the selector's deliberate fail-open behavior.
+// H3 routing state. A degraded H3-only route may recover beside a healthy peer
+// only after claiming both the rule's target-recovery slot and the target's
+// rate-limited protocol canary. Rule-level cooldown/probation remains authoritative;
+// when every route is penalized, retain the selector's deliberate fail-open behavior.
 func (runtime *routingRuntime) claimBoostRecoveryProbe(rule *config.Rule, now time.Time) routeRecoveryLease {
 	if runtime == nil || runtime.routes == nil || rule == nil || len(rule.Targets) == 0 ||
 		!runtime.routes.recoveryProbeDue(rule, now) {
@@ -1131,7 +1161,8 @@ func (runtime *routingRuntime) claimBoostRecoveryProbe(rule *config.Rule, now ti
 	}
 	if hasUnpenalized {
 		for address, penalty := range penalties {
-			if penalty > 0 {
+			target := targetByAddress(rule, address)
+			if penalty > 0 && (!targetUsesOnlyHTTP3(target) || runtime.http3OnlyRecoveryRestricted(rule, target, now)) {
 				excluded[address] = struct{}{}
 			}
 		}
@@ -1145,6 +1176,12 @@ func (runtime *routingRuntime) claimBoostRecoveryProbe(rule *config.Rule, now ti
 		return recovery
 	}
 	if probe, probeClaimed := runtime.routes.claimProtocolProbe(rule, target, now); probeClaimed {
+		if runtime.http3OnlyRecoveryRestricted(rule, target, now) {
+			// Protocol policy may have changed after the initial snapshot.
+			runtime.routes.releaseProtocolProbe(rule, target, probe)
+			runtime.routes.releaseRecoveryProbe(recovery)
+			return routeRecoveryLease{}
+		}
 		recovery.protocolProbe = probe
 		return recovery
 	}

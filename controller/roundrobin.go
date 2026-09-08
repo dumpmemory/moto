@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"moto/config"
 	"moto/utils"
 	"net"
@@ -50,77 +49,62 @@ func (runtime *routingRuntime) handleRoundrobin(ctx context.Context, conn net.Co
 	roundrobinBegin := time.Now()
 	dialCtx, cancelDial := context.WithTimeout(ctx, boostDecisionTimeout(rule))
 	defer cancelDial()
-	target, targetAttempt, err := runtime.outboundDialRoute(dialCtx, rule, v.Address)
-	if err != nil {
-		if isDialBulkheadError(err) {
-			if isDialTargetBulkheadSaturation(err) {
-				finalErr := err
-				lastFailedAddr := v.Address
-				utils.Logger.Debug("RoundRobin 目标拨号容量已满，立即尝试其他目标",
-					zap.String("ruleName", rule.Name),
-					zap.String("targetAddr", v.Address))
-				fallbackAttempts := 0
-				fallbackLimit := len(rule.Targets) - 1
-				if rule.Protocol == config.ProtocolSOCKS5 {
-					fallbackLimit = max(0, connectProxyTargetAttemptLimit(rule)-1)
-				}
-				for _, candidate := range rule.Targets {
-					if candidate.Address == v.Address {
-						continue
-					}
-					if fallbackAttempts >= fallbackLimit {
-						break
-					}
-					fallbackAttempts++
-					fallback, attempt, fallbackErr := runtime.outboundDialRouteWithOptions(
-						dialCtx, rule, candidate.Address, true, nil,
-					)
-					if fallbackErr == nil {
-						target = fallback
-						targetAttempt = attempt
-						selectedAddr = candidate.Address
-						err = nil
-						break
-					}
-					finalErr = errors.Join(finalErr, fallbackErr)
-					lastFailedAddr = candidate.Address
-					if isDialBulkheadError(fallbackErr) && !isDialTargetBulkheadSaturation(fallbackErr) {
-						break
-					}
-				}
-				if err != nil {
-					if rule.Protocol == config.ProtocolSOCKS5 {
-						setPendingSOCKS5Failure(conn, finalErr)
-						logConnectProxyFailure(rule, lastFailedAddr, finalErr, "RoundRobin 原生代理目标容量不足")
-					}
-					return
-				}
-			} else {
-				utils.Logger.Debug("前台拨号容量暂时不可用，结束当前 RoundRobin 连接",
-					zap.String("ruleName", rule.Name),
-					zap.String("remoteAddr", connAddr(conn)),
-					zap.String("targetAddr", v.Address),
-					zap.Error(err))
+	var target net.Conn
+	var targetAttempt routeAttempt
+	var err error
+	if rule.Protocol == config.ProtocolSOCKS5 {
+		target, targetAttempt, selectedAddr, err = runtime.dialSequentialConnectProxyTargets(dialCtx, rule, index)
+		if err != nil {
+			if connectProxySequentialFailureIsLocal(err) {
+				utils.Logger.Debug("RoundRobin 原生代理连接因本地准入或取消结束",
+					zap.String("ruleName", rule.Name), zap.Error(err))
 				return
 			}
-		} else {
-			if rule.Protocol == config.ProtocolSOCKS5 {
-				finalErr := err
-				if connectProxyTargetAttemptLimit(rule) > 1 {
-					candidate := rule.Targets[(index+1)%len(rule.Targets)]
-					fallback, attempt, fallbackErr := runtime.outboundDialRoute(dialCtx, rule, candidate.Address)
-					if fallbackErr == nil {
-						target = fallback
-						targetAttempt = attempt
-						selectedAddr = candidate.Address
-						err = nil
-					} else {
-						finalErr = errors.Join(finalErr, fallbackErr)
+			setPendingSOCKS5Failure(conn, err)
+			logConnectProxyFailure(rule, selectedAddr, err, "RoundRobin 原生代理连接失败")
+			return
+		}
+	} else {
+		target, targetAttempt, err = runtime.outboundDialRoute(dialCtx, rule, v.Address)
+		if err != nil {
+			if isDialBulkheadError(err) {
+				if isDialTargetBulkheadSaturation(err) {
+					utils.Logger.Debug("RoundRobin 目标拨号容量已满，立即尝试其他目标",
+						zap.String("ruleName", rule.Name),
+						zap.String("targetAddr", v.Address))
+					fallbackAttempts := 0
+					fallbackLimit := len(rule.Targets) - 1
+					for _, candidate := range rule.Targets {
+						if candidate.Address == v.Address {
+							continue
+						}
+						if fallbackAttempts >= fallbackLimit {
+							break
+						}
+						fallbackAttempts++
+						fallback, attempt, fallbackErr := runtime.outboundDialRouteWithOptions(
+							dialCtx, rule, candidate.Address, true, nil,
+						)
+						if fallbackErr == nil {
+							target = fallback
+							targetAttempt = attempt
+							selectedAddr = candidate.Address
+							err = nil
+							break
+						}
+						if isDialBulkheadError(fallbackErr) && !isDialTargetBulkheadSaturation(fallbackErr) {
+							break
+						}
 					}
-				}
-				if err != nil {
-					setPendingSOCKS5Failure(conn, finalErr)
-					logConnectProxyFailure(rule, selectedAddr, finalErr, "RoundRobin 原生代理连接失败")
+					if err != nil {
+						return
+					}
+				} else {
+					utils.Logger.Debug("前台拨号容量暂时不可用，结束当前 RoundRobin 连接",
+						zap.String("ruleName", rule.Name),
+						zap.String("remoteAddr", connAddr(conn)),
+						zap.String("targetAddr", v.Address),
+						zap.Error(err))
 					return
 				}
 			} else {
