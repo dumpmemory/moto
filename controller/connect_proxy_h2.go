@@ -114,9 +114,14 @@ func newHTTP2ConnectTransport(key http2ConnectTransportKey) *xhttp2.Transport {
 			MinVersion: tls.VersionTLS12,
 			ServerName: key.serverName,
 		},
-		DialTLSContext: func(ctx context.Context, network, address string, config *tls.Config) (net.Conn, error) {
-			return dialHTTP2TLS(ctx, network, address, config, profile)
+		DialTLSContext: func(ctx context.Context, network, address string, tlsConfig *tls.Config) (net.Conn, error) {
+			rule, _ := connectProxyRuleNameFromContext(ctx)
+			recordHandshake := metricConnectProxyHandshakeRecorder(rule, key.address, config.ConnectProxyH2)
+			connection, err := dialHTTP2TLS(ctx, network, address, tlsConfig, profile)
+			recordHandshake(connectProxyAttemptOutcome(err))
+			return connection, err
 		},
+		CountError:         metricConnectProxyH2ErrorCounter(key.address),
 		DisableCompression: true,
 		IdleConnTimeout:    http2ConnectIdleTimeout,
 		// Probe the physical H2 connection only after inbound frames stop.
@@ -269,6 +274,12 @@ func (manager *http2ConnectManager) dial(ctx context.Context, target *config.Tar
 
 	requestReader, requestWriter := io.Pipe()
 	streamCtx, cancelStream := context.WithCancel(context.Background())
+	// Retain only the bounded rule identity on the detached stream context.
+	// x/net passes it to a physical dial when needed; pooled reuse emits no
+	// handshake. Setup cancellation still leaves an established tunnel alive.
+	if rule, ok := connectProxyRuleNameFromContext(ctx); ok {
+		streamCtx = withConnectProxyRuleName(streamCtx, rule)
+	}
 	request := &http.Request{
 		Method:        http.MethodConnect,
 		URL:           &url.URL{Scheme: "https", Host: target.Address},

@@ -96,6 +96,21 @@ type connectProxyPayloadMetricKey struct {
 	direction string
 }
 
+// Finite bounds are fixed so every configured label set has bounded storage.
+// Overflow observations are represented by count and the rendered +Inf bucket.
+var connectProxySetupLatencyBounds = [...]time.Duration{
+	5 * time.Millisecond, 10 * time.Millisecond, 25 * time.Millisecond,
+	50 * time.Millisecond, 100 * time.Millisecond, 250 * time.Millisecond,
+	500 * time.Millisecond, time.Second, 2 * time.Second,
+	3 * time.Second, 5 * time.Second, 10 * time.Second,
+}
+
+type connectProxySetupHistogram struct {
+	buckets [len(connectProxySetupLatencyBounds)]uint64
+	nanos   uint64
+	count   uint64
+}
+
 // connectProxyTunnelMetrics is allocated once per live configured
 // rule/target/protocol label set. Successful tunnel wrappers keep a direct
 // pointer to it so payload accounting stays lock-free on the relay hot path.
@@ -110,112 +125,120 @@ type connectProxyTunnelMetrics struct {
 // deliberately cheap and dependency-free; rendering takes a snapshot so a
 // slow scrape never holds the write lock used by traffic paths.
 type metricRegistry struct {
-	mu               sync.RWMutex
-	ruleRefs         map[string]int
-	connectionRefs   map[connectionMetricKey]int
-	dialRefs         map[dialMetricKey]int
-	connectProxyRefs map[connectProxyMetricKey]int
+	mu                       sync.RWMutex
+	ruleRefs                 map[string]int
+	connectionRefs           map[connectionMetricKey]int
+	dialRefs                 map[dialMetricKey]int
+	connectProxyRefs         map[connectProxyMetricKey]int
+	connectProxyH2TargetRefs map[string]int
 
-	connectionsAccepted    map[connectionMetricKey]uint64
-	connectionsRejected    map[rejectionMetricKey]uint64
-	connectionsActive      map[connectionMetricKey]int64
-	relayBytes             map[relayMetricKey]uint64
-	relayErrors            map[relayMetricKey]uint64
-	relayDurationNanos     map[string]uint64
-	relayDurationCount     map[string]uint64
-	dialAttempts           map[dialMetricKey]uint64
-	dialSuccess            map[dialMetricKey]uint64
-	dialFailures           map[dialMetricKey]uint64
-	dialCanceled           map[dialMetricKey]uint64
-	dialLatencyNanos       map[dialMetricKey]uint64
-	dialLatencyCount       map[dialMetricKey]uint64
-	dialBulkheadWaitNanos  map[dialMetricKey]uint64
-	dialBulkheadWaitCount  map[dialMetricKey]uint64
-	dialBulkheadRejected   map[dialMetricKey]uint64
-	boostCacheHits         map[string]uint64
-	boostCacheMisses       map[string]uint64
-	boostHedgeEvents       map[boostHedgeMetricKey]uint64
-	boostHedgeDelayNanos   map[string]uint64
-	boostHedgeDelayCount   map[string]uint64
-	boostDecisionNanos     map[string]uint64
-	boostDecisionCount     map[string]uint64
-	connectProxyAttempts   map[connectProxyAttemptMetricKey]uint64
-	connectProxyHandshakes map[connectProxyAttemptMetricKey]uint64
-	connectProxySetupNanos map[connectProxyMetricKey]uint64
-	connectProxySetupCount map[connectProxyMetricKey]uint64
-	connectProxyFallbacks  map[connectProxyFallbackMetricKey]uint64
-	connectProxyTunnels    map[connectProxyMetricKey]*connectProxyTunnelMetrics
+	connectionsAccepted        map[connectionMetricKey]uint64
+	connectionsRejected        map[rejectionMetricKey]uint64
+	connectionsActive          map[connectionMetricKey]int64
+	relayBytes                 map[relayMetricKey]uint64
+	relayErrors                map[relayMetricKey]uint64
+	relayDurationNanos         map[string]uint64
+	relayDurationCount         map[string]uint64
+	dialAttempts               map[dialMetricKey]uint64
+	dialSuccess                map[dialMetricKey]uint64
+	dialFailures               map[dialMetricKey]uint64
+	dialCanceled               map[dialMetricKey]uint64
+	dialLatencyNanos           map[dialMetricKey]uint64
+	dialLatencyCount           map[dialMetricKey]uint64
+	dialBulkheadWaitNanos      map[dialMetricKey]uint64
+	dialBulkheadWaitCount      map[dialMetricKey]uint64
+	dialBulkheadRejected       map[dialMetricKey]uint64
+	boostCacheHits             map[string]uint64
+	boostCacheMisses           map[string]uint64
+	boostHedgeEvents           map[boostHedgeMetricKey]uint64
+	boostHedgeDelayNanos       map[string]uint64
+	boostHedgeDelayCount       map[string]uint64
+	boostDecisionNanos         map[string]uint64
+	boostDecisionCount         map[string]uint64
+	connectProxyAttempts       map[connectProxyAttemptMetricKey]uint64
+	connectProxyHandshakes     map[connectProxyAttemptMetricKey]uint64
+	connectProxySetupNanos     map[connectProxyMetricKey]uint64
+	connectProxySetupCount     map[connectProxyMetricKey]uint64
+	connectProxySetupLatency   map[connectProxyMetricKey]connectProxySetupHistogram
+	connectProxyH2PingFailures map[string]*atomic.Uint64
+	connectProxyFallbacks      map[connectProxyFallbackMetricKey]uint64
+	connectProxyTunnels        map[connectProxyMetricKey]*connectProxyTunnelMetrics
 }
 
 type metricSnapshot struct {
-	connectionsAccepted     map[connectionMetricKey]uint64
-	connectionsRejected     map[rejectionMetricKey]uint64
-	connectionsActive       map[connectionMetricKey]int64
-	relayBytes              map[relayMetricKey]uint64
-	relayErrors             map[relayMetricKey]uint64
-	relayDurationNanos      map[string]uint64
-	relayDurationCount      map[string]uint64
-	dialAttempts            map[dialMetricKey]uint64
-	dialSuccess             map[dialMetricKey]uint64
-	dialFailures            map[dialMetricKey]uint64
-	dialCanceled            map[dialMetricKey]uint64
-	dialLatencyNanos        map[dialMetricKey]uint64
-	dialLatencyCount        map[dialMetricKey]uint64
-	dialBulkheadWaitNanos   map[dialMetricKey]uint64
-	dialBulkheadWaitCount   map[dialMetricKey]uint64
-	dialBulkheadRejected    map[dialMetricKey]uint64
-	boostCacheHits          map[string]uint64
-	boostCacheMisses        map[string]uint64
-	boostHedgeEvents        map[boostHedgeMetricKey]uint64
-	boostHedgeDelayNanos    map[string]uint64
-	boostHedgeDelayCount    map[string]uint64
-	boostDecisionNanos      map[string]uint64
-	boostDecisionCount      map[string]uint64
-	connectProxyAttempts    map[connectProxyAttemptMetricKey]uint64
-	connectProxyHandshakes  map[connectProxyAttemptMetricKey]uint64
-	connectProxySetupNanos  map[connectProxyMetricKey]uint64
-	connectProxySetupCount  map[connectProxyMetricKey]uint64
-	connectProxyFallbacks   map[connectProxyFallbackMetricKey]uint64
-	connectProxyActive      map[connectProxyMetricKey]int64
-	connectProxyPayload     map[connectProxyPayloadMetricKey]uint64
-	connectProxyLastSuccess map[connectProxyMetricKey]int64
+	connectionsAccepted        map[connectionMetricKey]uint64
+	connectionsRejected        map[rejectionMetricKey]uint64
+	connectionsActive          map[connectionMetricKey]int64
+	relayBytes                 map[relayMetricKey]uint64
+	relayErrors                map[relayMetricKey]uint64
+	relayDurationNanos         map[string]uint64
+	relayDurationCount         map[string]uint64
+	dialAttempts               map[dialMetricKey]uint64
+	dialSuccess                map[dialMetricKey]uint64
+	dialFailures               map[dialMetricKey]uint64
+	dialCanceled               map[dialMetricKey]uint64
+	dialLatencyNanos           map[dialMetricKey]uint64
+	dialLatencyCount           map[dialMetricKey]uint64
+	dialBulkheadWaitNanos      map[dialMetricKey]uint64
+	dialBulkheadWaitCount      map[dialMetricKey]uint64
+	dialBulkheadRejected       map[dialMetricKey]uint64
+	boostCacheHits             map[string]uint64
+	boostCacheMisses           map[string]uint64
+	boostHedgeEvents           map[boostHedgeMetricKey]uint64
+	boostHedgeDelayNanos       map[string]uint64
+	boostHedgeDelayCount       map[string]uint64
+	boostDecisionNanos         map[string]uint64
+	boostDecisionCount         map[string]uint64
+	connectProxyAttempts       map[connectProxyAttemptMetricKey]uint64
+	connectProxyHandshakes     map[connectProxyAttemptMetricKey]uint64
+	connectProxySetupNanos     map[connectProxyMetricKey]uint64
+	connectProxySetupCount     map[connectProxyMetricKey]uint64
+	connectProxySetupLatency   map[connectProxyMetricKey]connectProxySetupHistogram
+	connectProxyH2PingFailures map[string]uint64
+	connectProxyFallbacks      map[connectProxyFallbackMetricKey]uint64
+	connectProxyActive         map[connectProxyMetricKey]int64
+	connectProxyPayload        map[connectProxyPayloadMetricKey]uint64
+	connectProxyLastSuccess    map[connectProxyMetricKey]int64
 }
 
 func newMetricRegistry() *metricRegistry {
 	return &metricRegistry{
-		ruleRefs:               make(map[string]int),
-		connectionRefs:         make(map[connectionMetricKey]int),
-		dialRefs:               make(map[dialMetricKey]int),
-		connectProxyRefs:       make(map[connectProxyMetricKey]int),
-		connectionsAccepted:    make(map[connectionMetricKey]uint64),
-		connectionsRejected:    make(map[rejectionMetricKey]uint64),
-		connectionsActive:      make(map[connectionMetricKey]int64),
-		relayBytes:             make(map[relayMetricKey]uint64),
-		relayErrors:            make(map[relayMetricKey]uint64),
-		relayDurationNanos:     make(map[string]uint64),
-		relayDurationCount:     make(map[string]uint64),
-		dialAttempts:           make(map[dialMetricKey]uint64),
-		dialSuccess:            make(map[dialMetricKey]uint64),
-		dialFailures:           make(map[dialMetricKey]uint64),
-		dialCanceled:           make(map[dialMetricKey]uint64),
-		dialLatencyNanos:       make(map[dialMetricKey]uint64),
-		dialLatencyCount:       make(map[dialMetricKey]uint64),
-		dialBulkheadWaitNanos:  make(map[dialMetricKey]uint64),
-		dialBulkheadWaitCount:  make(map[dialMetricKey]uint64),
-		dialBulkheadRejected:   make(map[dialMetricKey]uint64),
-		boostCacheHits:         make(map[string]uint64),
-		boostCacheMisses:       make(map[string]uint64),
-		boostHedgeEvents:       make(map[boostHedgeMetricKey]uint64),
-		boostHedgeDelayNanos:   make(map[string]uint64),
-		boostHedgeDelayCount:   make(map[string]uint64),
-		boostDecisionNanos:     make(map[string]uint64),
-		boostDecisionCount:     make(map[string]uint64),
-		connectProxyAttempts:   make(map[connectProxyAttemptMetricKey]uint64),
-		connectProxyHandshakes: make(map[connectProxyAttemptMetricKey]uint64),
-		connectProxySetupNanos: make(map[connectProxyMetricKey]uint64),
-		connectProxySetupCount: make(map[connectProxyMetricKey]uint64),
-		connectProxyFallbacks:  make(map[connectProxyFallbackMetricKey]uint64),
-		connectProxyTunnels:    make(map[connectProxyMetricKey]*connectProxyTunnelMetrics),
+		ruleRefs:                   make(map[string]int),
+		connectionRefs:             make(map[connectionMetricKey]int),
+		dialRefs:                   make(map[dialMetricKey]int),
+		connectProxyRefs:           make(map[connectProxyMetricKey]int),
+		connectProxyH2TargetRefs:   make(map[string]int),
+		connectionsAccepted:        make(map[connectionMetricKey]uint64),
+		connectionsRejected:        make(map[rejectionMetricKey]uint64),
+		connectionsActive:          make(map[connectionMetricKey]int64),
+		relayBytes:                 make(map[relayMetricKey]uint64),
+		relayErrors:                make(map[relayMetricKey]uint64),
+		relayDurationNanos:         make(map[string]uint64),
+		relayDurationCount:         make(map[string]uint64),
+		dialAttempts:               make(map[dialMetricKey]uint64),
+		dialSuccess:                make(map[dialMetricKey]uint64),
+		dialFailures:               make(map[dialMetricKey]uint64),
+		dialCanceled:               make(map[dialMetricKey]uint64),
+		dialLatencyNanos:           make(map[dialMetricKey]uint64),
+		dialLatencyCount:           make(map[dialMetricKey]uint64),
+		dialBulkheadWaitNanos:      make(map[dialMetricKey]uint64),
+		dialBulkheadWaitCount:      make(map[dialMetricKey]uint64),
+		dialBulkheadRejected:       make(map[dialMetricKey]uint64),
+		boostCacheHits:             make(map[string]uint64),
+		boostCacheMisses:           make(map[string]uint64),
+		boostHedgeEvents:           make(map[boostHedgeMetricKey]uint64),
+		boostHedgeDelayNanos:       make(map[string]uint64),
+		boostHedgeDelayCount:       make(map[string]uint64),
+		boostDecisionNanos:         make(map[string]uint64),
+		boostDecisionCount:         make(map[string]uint64),
+		connectProxyAttempts:       make(map[connectProxyAttemptMetricKey]uint64),
+		connectProxyHandshakes:     make(map[connectProxyAttemptMetricKey]uint64),
+		connectProxySetupNanos:     make(map[connectProxyMetricKey]uint64),
+		connectProxySetupCount:     make(map[connectProxyMetricKey]uint64),
+		connectProxySetupLatency:   make(map[connectProxyMetricKey]connectProxySetupHistogram),
+		connectProxyH2PingFailures: make(map[string]*atomic.Uint64),
+		connectProxyFallbacks:      make(map[connectProxyFallbackMetricKey]uint64),
+		connectProxyTunnels:        make(map[connectProxyMetricKey]*connectProxyTunnelMetrics),
 	}
 }
 
@@ -236,6 +259,12 @@ func (registry *metricRegistry) registerRules(rules []*config.Rule) {
 		registry.dialRefs[key]++
 	}
 	for key := range connectProxyKeys {
+		if key.protocol == config.ConnectProxyH2 {
+			if registry.connectProxyH2TargetRefs[key.target] == 0 {
+				registry.connectProxyH2PingFailures[key.target] = &atomic.Uint64{}
+			}
+			registry.connectProxyH2TargetRefs[key.target]++
+		}
 		if registry.connectProxyRefs[key] == 0 {
 			registry.connectProxyTunnels[key] = &connectProxyTunnelMetrics{}
 		}
@@ -249,6 +278,14 @@ func (registry *metricRegistry) unregisterRules(rules []*config.Rule) {
 	defer registry.mu.Unlock()
 	retiredConnectProxyKeys := make(map[connectProxyMetricKey]struct{}, len(connectProxyKeys))
 	for key := range connectProxyKeys {
+		if key.protocol == config.ConnectProxyH2 {
+			if registry.connectProxyH2TargetRefs[key.target] > 1 {
+				registry.connectProxyH2TargetRefs[key.target]--
+			} else {
+				delete(registry.connectProxyH2TargetRefs, key.target)
+				delete(registry.connectProxyH2PingFailures, key.target)
+			}
+		}
 		if registry.connectProxyRefs[key] > 1 {
 			registry.connectProxyRefs[key]--
 			continue
@@ -256,6 +293,7 @@ func (registry *metricRegistry) unregisterRules(rules []*config.Rule) {
 		delete(registry.connectProxyRefs, key)
 		delete(registry.connectProxySetupNanos, key)
 		delete(registry.connectProxySetupCount, key)
+		delete(registry.connectProxySetupLatency, key)
 		delete(registry.connectProxyTunnels, key)
 		retiredConnectProxyKeys[key] = struct{}{}
 	}
@@ -509,6 +547,24 @@ func metricConnectProxyAttempt(rule, target, protocol, outcome string, setup tim
 	if setupObserved {
 		processMetrics.connectProxySetupNanos[baseKey] += uint64(setup)
 		processMetrics.connectProxySetupCount[baseKey]++
+		// Preserve the legacy summary, but exclude racing losers and local
+		// admission decisions from percentile observations. H3 can report
+		// capacity from inside its dialer without sending CONNECT headers.
+		switch outcome {
+		case connectProxyAttemptCanceled, connectProxyAttemptCapacity,
+			connectProxyAttemptCooldown, connectProxyAttemptUnavailable:
+		default:
+			histogram := processMetrics.connectProxySetupLatency[baseKey]
+			histogram.nanos += uint64(setup)
+			histogram.count++
+			for index, bound := range connectProxySetupLatencyBounds {
+				if setup <= bound {
+					histogram.buckets[index]++
+					break
+				}
+			}
+			processMetrics.connectProxySetupLatency[baseKey] = histogram
+		}
 	}
 	processMetrics.mu.Unlock()
 }
@@ -517,18 +573,64 @@ func metricConnectProxyAttempt(rule, target, protocol, outcome string, setup tim
 // request attempts remain separate: many requests may wait on one handshake,
 // so this bounded family makes coalescing and failure amplification observable.
 func metricConnectProxyHandshake(rule, target, outcome string) {
-	if rule == "" || target == "" || !connectProxyAttemptOutcomeValid(outcome) {
+	metricConnectProxyProtocolHandshake(rule, target, config.ConnectProxyH3, outcome)
+}
+
+// H2 records TCP+TLS setup; H3 records DNS+QUIC setup. Attribution belongs to
+// the rule initiating the physical dial, even if other rules reuse its pool.
+func metricConnectProxyProtocolHandshake(rule, target, protocol, outcome string) {
+	if rule == "" || target == "" || !connectProxyProtocolValid(protocol) || !connectProxyAttemptOutcomeValid(outcome) {
 		return
 	}
-	baseKey := connectProxyMetricKey{rule: rule, target: target, protocol: config.ConnectProxyH3}
+	baseKey := connectProxyMetricKey{rule: rule, target: target, protocol: protocol}
 	handshakeKey := connectProxyAttemptMetricKey{
-		rule: rule, target: target, protocol: config.ConnectProxyH3, outcome: outcome,
+		rule: rule, target: target, protocol: protocol, outcome: outcome,
 	}
 	processMetrics.mu.Lock()
 	if processMetrics.connectProxyRefs[baseKey] != 0 {
 		processMetrics.connectProxyHandshakes[handshakeKey]++
 	}
 	processMetrics.mu.Unlock()
+}
+
+// A physical H2 dial can complete after its metrics generation has retired.
+// Capture the existing series identity before dialing so deleting and later
+// registering the same labels cannot charge an old dial to a new generation.
+func metricConnectProxyHandshakeRecorder(rule, target, protocol string) func(string) {
+	key := connectProxyMetricKey{rule: rule, target: target, protocol: protocol}
+	processMetrics.mu.RLock()
+	identity := processMetrics.connectProxyTunnels[key]
+	processMetrics.mu.RUnlock()
+	return func(outcome string) {
+		if identity == nil || !connectProxyAttemptOutcomeValid(outcome) {
+			return
+		}
+		processMetrics.mu.Lock()
+		if processMetrics.connectProxyRefs[key] != 0 && processMetrics.connectProxyTunnels[key] == identity {
+			processMetrics.connectProxyHandshakes[connectProxyAttemptMetricKey{
+				rule: rule, target: target, protocol: protocol, outcome: outcome,
+			}]++
+		}
+		processMetrics.mu.Unlock()
+	}
+}
+
+// x/net exposes health-PING loss at transport level, without the originating
+// physical connection or rule. H2 transports can be shared by several rules,
+// so count once by configured proxy target, never once per affected stream.
+// The callback includes PING errors as well as timeouts; do not call it a
+// timeout-only counter. Unrelated CountError values are intentionally ignored.
+func metricConnectProxyH2ErrorCounter(target string) func(string) {
+	processMetrics.mu.RLock()
+	counter := processMetrics.connectProxyH2PingFailures[target]
+	processMetrics.mu.RUnlock()
+	return func(errorType string) {
+		if errorType == "conn_close_lost_ping" && counter != nil {
+			// The pointer belongs to this target registration's lifetime. Once
+			// retired it cannot affect a newly registered same-address target.
+			counter.Add(1)
+		}
+	}
 }
 
 // metricConnectProxyFallback records only the configured H3-to-H2 transition.
@@ -685,6 +787,10 @@ func (registry *metricRegistry) snapshot() metricSnapshot {
 	connectProxyActive := make(map[connectProxyMetricKey]int64, len(registry.connectProxyTunnels))
 	connectProxyPayload := make(map[connectProxyPayloadMetricKey]uint64, len(registry.connectProxyTunnels)*2)
 	connectProxyLastSuccess := make(map[connectProxyMetricKey]int64, len(registry.connectProxyTunnels))
+	connectProxyH2PingFailures := make(map[string]uint64, len(registry.connectProxyH2PingFailures))
+	for target, counter := range registry.connectProxyH2PingFailures {
+		connectProxyH2PingFailures[target] = counter.Load()
+	}
 	for key, metrics := range registry.connectProxyTunnels {
 		if metrics == nil {
 			continue
@@ -705,37 +811,39 @@ func (registry *metricRegistry) snapshot() metricSnapshot {
 		connectProxyLastSuccess[key] = metrics.lastSuccessUnix.Load()
 	}
 	return metricSnapshot{
-		connectionsAccepted:     cloneMetricMap(registry.connectionsAccepted),
-		connectionsRejected:     cloneMetricMap(registry.connectionsRejected),
-		connectionsActive:       cloneMetricMap(registry.connectionsActive),
-		relayBytes:              cloneMetricMap(registry.relayBytes),
-		relayErrors:             cloneMetricMap(registry.relayErrors),
-		relayDurationNanos:      cloneMetricMap(registry.relayDurationNanos),
-		relayDurationCount:      cloneMetricMap(registry.relayDurationCount),
-		dialAttempts:            cloneMetricMap(registry.dialAttempts),
-		dialSuccess:             cloneMetricMap(registry.dialSuccess),
-		dialFailures:            cloneMetricMap(registry.dialFailures),
-		dialCanceled:            cloneMetricMap(registry.dialCanceled),
-		dialLatencyNanos:        cloneMetricMap(registry.dialLatencyNanos),
-		dialLatencyCount:        cloneMetricMap(registry.dialLatencyCount),
-		dialBulkheadWaitNanos:   cloneMetricMap(registry.dialBulkheadWaitNanos),
-		dialBulkheadWaitCount:   cloneMetricMap(registry.dialBulkheadWaitCount),
-		dialBulkheadRejected:    cloneMetricMap(registry.dialBulkheadRejected),
-		boostCacheHits:          cloneMetricMap(registry.boostCacheHits),
-		boostCacheMisses:        cloneMetricMap(registry.boostCacheMisses),
-		boostHedgeEvents:        cloneMetricMap(registry.boostHedgeEvents),
-		boostHedgeDelayNanos:    cloneMetricMap(registry.boostHedgeDelayNanos),
-		boostHedgeDelayCount:    cloneMetricMap(registry.boostHedgeDelayCount),
-		boostDecisionNanos:      cloneMetricMap(registry.boostDecisionNanos),
-		boostDecisionCount:      cloneMetricMap(registry.boostDecisionCount),
-		connectProxyAttempts:    cloneMetricMap(registry.connectProxyAttempts),
-		connectProxyHandshakes:  cloneMetricMap(registry.connectProxyHandshakes),
-		connectProxySetupNanos:  cloneMetricMap(registry.connectProxySetupNanos),
-		connectProxySetupCount:  cloneMetricMap(registry.connectProxySetupCount),
-		connectProxyFallbacks:   cloneMetricMap(registry.connectProxyFallbacks),
-		connectProxyActive:      connectProxyActive,
-		connectProxyPayload:     connectProxyPayload,
-		connectProxyLastSuccess: connectProxyLastSuccess,
+		connectionsAccepted:        cloneMetricMap(registry.connectionsAccepted),
+		connectionsRejected:        cloneMetricMap(registry.connectionsRejected),
+		connectionsActive:          cloneMetricMap(registry.connectionsActive),
+		relayBytes:                 cloneMetricMap(registry.relayBytes),
+		relayErrors:                cloneMetricMap(registry.relayErrors),
+		relayDurationNanos:         cloneMetricMap(registry.relayDurationNanos),
+		relayDurationCount:         cloneMetricMap(registry.relayDurationCount),
+		dialAttempts:               cloneMetricMap(registry.dialAttempts),
+		dialSuccess:                cloneMetricMap(registry.dialSuccess),
+		dialFailures:               cloneMetricMap(registry.dialFailures),
+		dialCanceled:               cloneMetricMap(registry.dialCanceled),
+		dialLatencyNanos:           cloneMetricMap(registry.dialLatencyNanos),
+		dialLatencyCount:           cloneMetricMap(registry.dialLatencyCount),
+		dialBulkheadWaitNanos:      cloneMetricMap(registry.dialBulkheadWaitNanos),
+		dialBulkheadWaitCount:      cloneMetricMap(registry.dialBulkheadWaitCount),
+		dialBulkheadRejected:       cloneMetricMap(registry.dialBulkheadRejected),
+		boostCacheHits:             cloneMetricMap(registry.boostCacheHits),
+		boostCacheMisses:           cloneMetricMap(registry.boostCacheMisses),
+		boostHedgeEvents:           cloneMetricMap(registry.boostHedgeEvents),
+		boostHedgeDelayNanos:       cloneMetricMap(registry.boostHedgeDelayNanos),
+		boostHedgeDelayCount:       cloneMetricMap(registry.boostHedgeDelayCount),
+		boostDecisionNanos:         cloneMetricMap(registry.boostDecisionNanos),
+		boostDecisionCount:         cloneMetricMap(registry.boostDecisionCount),
+		connectProxyAttempts:       cloneMetricMap(registry.connectProxyAttempts),
+		connectProxyHandshakes:     cloneMetricMap(registry.connectProxyHandshakes),
+		connectProxySetupNanos:     cloneMetricMap(registry.connectProxySetupNanos),
+		connectProxySetupCount:     cloneMetricMap(registry.connectProxySetupCount),
+		connectProxySetupLatency:   cloneMetricMap(registry.connectProxySetupLatency),
+		connectProxyH2PingFailures: connectProxyH2PingFailures,
+		connectProxyFallbacks:      cloneMetricMap(registry.connectProxyFallbacks),
+		connectProxyActive:         connectProxyActive,
+		connectProxyPayload:        connectProxyPayload,
+		connectProxyLastSuccess:    connectProxyLastSuccess,
 	}
 }
 
@@ -919,12 +1027,33 @@ func renderPrometheusMetrics(renderGauges ...func(*strings.Builder)) string {
 		writeMetricSample(&output, "moto_connect_proxy_handshakes_total", labels, strconv.FormatUint(snapshot.connectProxyHandshakes[key], 10))
 	}
 
+	writeMetricHeader(&output, "moto_connect_proxy_h2_ping_failures_total", "Physical H2 connections closed after a failed health PING, including timeouts; shared across rules by configured target.", "counter")
+	for _, target := range sortedStringKeys(snapshot.connectProxyH2PingFailures) {
+		labels := []prometheusLabel{{"target", target}, {"protocol", config.ConnectProxyH2}}
+		writeMetricSample(&output, "moto_connect_proxy_h2_ping_failures_total", labels, strconv.FormatUint(snapshot.connectProxyH2PingFailures[target], 10))
+	}
+
 	writeMetricHeader(&output, "moto_connect_proxy_setup_duration_seconds", "Native CONNECT setup duration in seconds by rule, target, and protocol.", "summary")
 	for _, key := range sortedConnectProxyKeys(snapshot.connectProxySetupCount) {
 		labels := []prometheusLabel{{"rule", key.rule}, {"target", key.target}, {"protocol", key.protocol}}
 		seconds := float64(snapshot.connectProxySetupNanos[key]) / float64(time.Second)
 		writeMetricSample(&output, "moto_connect_proxy_setup_duration_seconds_sum", labels, strconv.FormatFloat(seconds, 'g', -1, 64))
 		writeMetricSample(&output, "moto_connect_proxy_setup_duration_seconds_count", labels, strconv.FormatUint(snapshot.connectProxySetupCount[key], 10))
+	}
+
+	writeMetricHeader(&output, "moto_connect_proxy_setup_latency_seconds", "Observed native CONNECT setup latency in seconds, excluding caller cancellations and local skips.", "histogram")
+	for _, key := range sortedConnectProxyKeys(snapshot.connectProxySetupLatency) {
+		labels := []prometheusLabel{{"rule", key.rule}, {"target", key.target}, {"protocol", key.protocol}}
+		histogram := snapshot.connectProxySetupLatency[key]
+		var cumulative uint64
+		for index, bound := range connectProxySetupLatencyBounds {
+			cumulative += histogram.buckets[index]
+			upper := strconv.FormatFloat(bound.Seconds(), 'g', -1, 64)
+			writeMetricSample(&output, "moto_connect_proxy_setup_latency_seconds_bucket", append(labels, prometheusLabel{"le", upper}), strconv.FormatUint(cumulative, 10))
+		}
+		writeMetricSample(&output, "moto_connect_proxy_setup_latency_seconds_bucket", append(labels, prometheusLabel{"le", "+Inf"}), strconv.FormatUint(histogram.count, 10))
+		writeMetricSample(&output, "moto_connect_proxy_setup_latency_seconds_sum", labels, strconv.FormatFloat(float64(histogram.nanos)/float64(time.Second), 'g', -1, 64))
+		writeMetricSample(&output, "moto_connect_proxy_setup_latency_seconds_count", labels, strconv.FormatUint(histogram.count, 10))
 	}
 
 	writeMetricHeader(&output, "moto_connect_proxy_active_tunnels", "Established HTTP CONNECT tunnels currently open by rule, target, and protocol.", "gauge")

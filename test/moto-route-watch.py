@@ -24,6 +24,14 @@ PAYLOAD_METRIC = "moto_connect_proxy_payload_bytes_total"
 LAST_SUCCESS_METRIC = "moto_connect_proxy_last_success_timestamp_seconds"
 REQUIRED_METRICS = (ACTIVE_METRIC, PAYLOAD_METRIC, LAST_SUCCESS_METRIC)
 
+ACTIVE_HEALTH_RECOVERY_METRICS = {
+    "moto_active_health_recovery_successes": "active_health_recovery_successes",
+    "moto_active_health_recovery_required_successes": "active_health_recovery_required_successes",
+    "moto_active_health_next_probe_timestamp_seconds": "active_health_next_probe_timestamp_seconds",
+    "moto_active_health_probe_in_flight": "active_health_probe_in_flight",
+    "moto_active_health_last_probe_success_timestamp_seconds": "active_health_last_probe_success_timestamp_seconds",
+    "moto_active_health_last_recovery_timestamp_seconds": "active_health_last_recovery_timestamp_seconds",
+}
 ROUTE_ATTEMPT_METRICS = {
     "moto_route_latency_ewma_seconds": "latency_ewma_seconds",
     "moto_route_observed": "observed",
@@ -35,6 +43,7 @@ ROUTE_ATTEMPT_METRICS = {
     "moto_route_last_recovery_timestamp_seconds": "last_recovery_timestamp_seconds",
     "moto_route_last_attempt_timestamp_seconds": "last_attempt_timestamp_seconds",
     "moto_active_health_unhealthy": "active_health_unhealthy",
+    **ACTIVE_HEALTH_RECOVERY_METRICS,
 }
 DIAL_ATTEMPT_METRICS = {
     "moto_dial_attempts_total": "attempts",
@@ -216,6 +225,14 @@ class TargetAttemptView:
     last_recovery_timestamp_seconds: Optional[float]
     active_health_unhealthy: Optional[bool]
     status: str
+    route_status: str = "unknown"
+    active_health_status: str = "unknown"
+    active_health_recovery_successes: Optional[int] = None
+    active_health_recovery_required_successes: Optional[int] = None
+    active_health_next_probe_timestamp_seconds: Optional[float] = None
+    active_health_probe_in_flight: Optional[bool] = None
+    active_health_last_probe_success_timestamp_seconds: Optional[float] = None
+    active_health_last_recovery_timestamp_seconds: Optional[float] = None
 
 
 @dataclass
@@ -632,6 +649,41 @@ def optional_integer(
     return max(0, int(round(values.get(field_name, 0.0))))
 
 
+def active_health_recovery_values(
+    sample: Sample,
+    values: Mapping[str, float],
+) -> Dict[str, object]:
+    result: Dict[str, object] = {}
+    for metric, field_name in ACTIVE_HEALTH_RECOVERY_METRICS.items():
+        # Exporter declarations and other targets' samples do not establish this
+        # target's confirmation progress. Preserve missing/non-finite samples.
+        if metric not in sample.available_metrics or field_name not in values:
+            result[field_name] = None
+        elif field_name == "active_health_probe_in_flight":
+            result[field_name] = optional_boolean(sample, values, metric, field_name)
+        elif field_name in (
+            "active_health_recovery_successes",
+            "active_health_recovery_required_successes",
+        ):
+            result[field_name] = optional_integer(sample, values, metric, field_name)
+        else:
+            result[field_name] = max(0.0, values[field_name])
+    return result
+
+
+def active_health_status(
+    unhealthy: Optional[bool],
+    recovery_successes: Optional[int],
+) -> str:
+    if unhealthy is None:
+        return "unknown"
+    if not unhealthy:
+        return "healthy"
+    if recovery_successes is not None and recovery_successes > 0:
+        return "recovering"
+    return "unhealthy"
+
+
 def target_attempt_status(
     observed: Optional[bool],
     consecutive_failures: Optional[int],
@@ -808,11 +860,29 @@ def build_attempt_window(
                     0.0,
                 ),
             )
-        active_health_unhealthy = optional_boolean(
-            current,
-            route_values,
-            gauge_metrics["active_health_unhealthy"],
-            "active_health_unhealthy",
+        active_health_unhealthy = None
+        if "active_health_unhealthy" in route_values:
+            active_health_unhealthy = optional_boolean(
+                current,
+                route_values,
+                gauge_metrics["active_health_unhealthy"],
+                "active_health_unhealthy",
+            )
+        health_recovery = active_health_recovery_values(current, route_values)
+        health_status = active_health_status(
+            active_health_unhealthy,
+            health_recovery["active_health_recovery_successes"],
+        )
+        route_status = target_attempt_status(
+            observed,
+            consecutive_failures,
+            circuit_open,
+            half_open,
+            circuit_cooldown_remaining_seconds,
+            probe_due,
+            last_recovery_timestamp_seconds,
+            None,
+            current.wall_time,
         )
         targets.append(
             TargetAttemptView(
@@ -836,17 +906,14 @@ def build_attempt_window(
                 probe_due=probe_due,
                 last_recovery_timestamp_seconds=last_recovery_timestamp_seconds,
                 active_health_unhealthy=active_health_unhealthy,
-                status=target_attempt_status(
-                    observed,
-                    consecutive_failures,
-                    circuit_open,
-                    half_open,
-                    circuit_cooldown_remaining_seconds,
-                    probe_due,
-                    last_recovery_timestamp_seconds,
-                    active_health_unhealthy,
-                    current.wall_time,
+                status=(
+                    f"active_health_{health_status}"
+                    if active_health_unhealthy
+                    else route_status
                 ),
+                route_status=route_status,
+                active_health_status=health_status,
+                **health_recovery,
             )
         )
 
@@ -1492,6 +1559,12 @@ def target_attempt_to_dict(
             else None
         ),
         "active_health_unhealthy": target.active_health_unhealthy,
+        "active_health_status": target.active_health_status,
+        "route_status": target.route_status,
+        **{
+            field_name: getattr(target, field_name)
+            for field_name in ACTIVE_HEALTH_RECOVERY_METRICS.values()
+        },
         "status": target.status,
     }
 
@@ -1731,8 +1804,15 @@ def format_attempt_age(timestamp: float, wall_time: float) -> str:
 
 
 def target_attempt_status_text(target: TargetAttemptView, color: bool) -> str:
+    if target.status == "active_health_recovering":
+        required = target.active_health_recovery_required_successes
+        required_text = str(required) if required is not None and required > 0 else "?"
+        return red(
+            f"恢复确认 {target.active_health_recovery_successes}/{required_text}",
+            color,
+        )
     if target.status == "active_health_unhealthy":
-        return red("健康检查排除", color)
+        return red("主动检查未恢复", color)
     if target.status == "circuit_open":
         return red("熔断", color)
     if target.status == "cooling_down":

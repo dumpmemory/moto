@@ -196,6 +196,21 @@ def attempt_metrics_body(
     return "\n".join(lines) + "\n"
 
 
+def active_health_metrics_body(
+    *,
+    target: str = "h2.example:443",
+    rule: str = "mixed",
+    mode: str = "boost",
+    **values: object,
+) -> str:
+    labels = f'rule="{rule}",mode="{mode}",target="{target}"'
+    lines = []
+    for field_name, value in values.items():
+        metric = f"moto_active_health_{field_name}"
+        lines.extend([f"# TYPE {metric} gauge", f"{metric}{{{labels}}} {value}"])
+    return "\n".join(lines) + "\n"
+
+
 def route(
     key: WATCH.RouteKey,
     rate: float,
@@ -692,6 +707,270 @@ class RouteWatchTest(unittest.TestCase):
         self.assertEqual(payload["last_recovery_timestamp_seconds"], 180.0)
         self.assertEqual(payload["last_recovery_age_seconds"], 20.0)
         self.assertEqual(payload["status"], "cooling_down")
+
+    def test_active_health_recovery_metrics_preserve_values_and_types(self) -> None:
+        sample = WATCH.parse_metrics(
+            metrics_body()
+            + attempt_metrics_body()
+            + active_health_metrics_body(
+                unhealthy=1,
+                recovery_successes=1,
+                recovery_required_successes=2,
+                next_probe_timestamp_seconds=215.25,
+                probe_in_flight=1,
+                last_probe_success_timestamp_seconds=195.5,
+                last_recovery_timestamp_seconds=170.75,
+            ),
+            200.0,
+            200.0,
+        )
+        by_target = {
+            item.target: item for item in WATCH.build_attempt_window(sample, None).targets
+        }
+        target = by_target["h2.example:443"]
+        payload = WATCH.target_attempt_to_dict(target, sample.wall_time)
+
+        self.assertEqual(target.status, "active_health_recovering")
+        self.assertEqual(payload["active_health_status"], "recovering")
+        self.assertEqual(payload["route_status"], "healthy")
+        self.assertEqual(payload["active_health_recovery_successes"], 1)
+        self.assertIsInstance(payload["active_health_recovery_successes"], int)
+        self.assertEqual(payload["active_health_recovery_required_successes"], 2)
+        self.assertEqual(payload["active_health_next_probe_timestamp_seconds"], 215.25)
+        self.assertIs(payload["active_health_probe_in_flight"], True)
+        self.assertEqual(payload["active_health_last_probe_success_timestamp_seconds"], 195.5)
+        self.assertEqual(payload["active_health_last_recovery_timestamp_seconds"], 170.75)
+        self.assertEqual(WATCH.target_attempt_status_text(target, False), "恢复确认 1/2")
+        for field_name in WATCH.ACTIVE_HEALTH_RECOVERY_METRICS.values():
+            self.assertIsNone(getattr(by_target["h3.example:443"], field_name))
+
+    def test_active_health_zero_successes_explains_exclusion(self) -> None:
+        sample = WATCH.parse_metrics(
+            metrics_body()
+            + attempt_metrics_body()
+            + active_health_metrics_body(
+                unhealthy=1,
+                recovery_successes=0,
+                recovery_required_successes=2,
+                probe_in_flight=0,
+                next_probe_timestamp_seconds=210,
+            ),
+            200.0,
+            200.0,
+        )
+        target = next(
+            item for item in WATCH.build_attempt_window(sample, None).targets
+            if item.target == "h2.example:443"
+        )
+
+        self.assertEqual(target.status, "active_health_unhealthy")
+        self.assertEqual(target.active_health_status, "unhealthy")
+        self.assertEqual(WATCH.target_attempt_status_text(target, False), "主动检查未恢复")
+        self.assertIs(target.active_health_probe_in_flight, False)
+
+    def test_active_health_confirmation_keeps_each_target_recovery_layer(self) -> None:
+        cases = [
+            ("cooling_down", {"h2_circuit_open": 1, "h2_cooldown_remaining": 8}),
+            ("probe_due", {"h2_circuit_open": 1, "h2_probe_due": 1}),
+            ("half_open", {"h2_circuit_open": 1, "h2_half_open": 1}),
+            ("recently_recovered", {"h2_last_recovery": 195}),
+        ]
+        for route_status, arguments in cases:
+            with self.subTest(route_status=route_status):
+                sample = WATCH.parse_metrics(
+                    metrics_body()
+                    + attempt_metrics_body(**arguments)
+                    + active_health_metrics_body(
+                        unhealthy=1, recovery_successes=1, recovery_required_successes=2
+                    ),
+                    200.0,
+                    200.0,
+                )
+                target = next(
+                    item for item in WATCH.build_attempt_window(sample, None).targets
+                    if item.target == "h2.example:443"
+                )
+                payload = WATCH.target_attempt_to_dict(target, sample.wall_time)
+
+                self.assertEqual(payload["status"], "active_health_recovering")
+                self.assertEqual(payload["route_status"], route_status)
+                self.assertEqual(payload["active_health_status"], "recovering")
+                self.assertEqual(WATCH.target_attempt_status_text(target, False), "恢复确认 1/2")
+
+    def test_active_health_recovered_does_not_hide_route_cooldown(self) -> None:
+        sample = WATCH.parse_metrics(
+            metrics_body()
+            + attempt_metrics_body(h2_circuit_open=1, h2_cooldown_remaining=8)
+            + active_health_metrics_body(
+                unhealthy=0,
+                recovery_successes=2,
+                recovery_required_successes=2,
+                last_recovery_timestamp_seconds=199,
+            ),
+            200.0,
+            200.0,
+        )
+        target = next(
+            item for item in WATCH.build_attempt_window(sample, None).targets
+            if item.target == "h2.example:443"
+        )
+
+        self.assertEqual(target.active_health_status, "healthy")
+        self.assertEqual(target.route_status, "cooling_down")
+        self.assertEqual(target.status, "cooling_down")
+        self.assertEqual(WATCH.target_attempt_status_text(target, False), "冷却中 8.0s")
+
+    def test_old_active_health_metrics_do_not_invent_confirmation_progress(self) -> None:
+        body = metrics_body() + attempt_metrics_body()
+        # Old exporters have neither declarations nor samples for the six gauges.
+        body = "\n".join(
+            line for line in body.splitlines()
+            if not any(metric in line for metric in WATCH.ACTIVE_HEALTH_RECOVERY_METRICS)
+        ) + "\n"
+        sample = WATCH.parse_metrics(
+            body + active_health_metrics_body(unhealthy=1), 200.0, 200.0
+        )
+        target = next(
+            item for item in WATCH.build_attempt_window(sample, None).targets
+            if item.target == "h2.example:443"
+        )
+        payload = WATCH.target_attempt_to_dict(target, sample.wall_time)
+
+        self.assertEqual(target.status, "active_health_unhealthy")
+        self.assertEqual(WATCH.target_attempt_status_text(target, False), "主动检查未恢复")
+        for metric, field_name in WATCH.ACTIVE_HEALTH_RECOVERY_METRICS.items():
+            self.assertNotIn(metric, sample.available_metrics)
+            self.assertIsNone(payload[field_name])
+
+    def test_active_health_declarations_without_samples_stay_unknown(self) -> None:
+        sample = WATCH.parse_metrics(
+            metrics_body() + attempt_metrics_body() + active_health_metrics_body(unhealthy=1),
+            200.0,
+            200.0,
+        )
+        target = next(
+            item for item in WATCH.build_attempt_window(sample, None).targets
+            if item.target == "h2.example:443"
+        )
+
+        for metric, field_name in WATCH.ACTIVE_HEALTH_RECOVERY_METRICS.items():
+            self.assertIn(metric, sample.available_metrics)
+            self.assertIsNone(getattr(target, field_name))
+        self.assertEqual(WATCH.target_attempt_status_text(target, False), "主动检查未恢复")
+
+    def test_missing_target_active_health_state_is_unknown_not_healthy(self) -> None:
+        route_body = metrics_body() + attempt_metrics_body(
+            h2_circuit_open=1, h2_cooldown_remaining=8
+        )
+        declarations_only = "\n".join(
+            line for line in route_body.splitlines()
+            if not line.startswith("moto_active_health_")
+        ) + "\n"
+        active_health_disabled = "\n".join(
+            line for line in route_body.splitlines()
+            if "moto_active_health_" not in line
+        ) + "\n"
+        cases = [
+            ("type_declaration_only", declarations_only, True),
+            (
+                "other_target_has_values",
+                declarations_only + active_health_metrics_body(
+                    target="h3.example:443", unhealthy=0,
+                    recovery_successes=0, recovery_required_successes=2,
+                ),
+                True,
+            ),
+            ("active_health_disabled", active_health_disabled, False),
+            (
+                "nonfinite_unhealthy_sample",
+                declarations_only + active_health_metrics_body(
+                    unhealthy="NaN", recovery_successes=0,
+                    recovery_required_successes=2, probe_in_flight=0,
+                ),
+                True,
+            ),
+        ]
+        for name, body, metric_available in cases:
+            with self.subTest(case=name):
+                sample = WATCH.parse_metrics(body, 200.0, 200.0)
+                target = next(
+                    item for item in WATCH.build_attempt_window(sample, None).targets
+                    if item.target == "h2.example:443"
+                )
+                payload = WATCH.target_attempt_to_dict(target, sample.wall_time)
+
+                self.assertEqual(
+                    "moto_active_health_unhealthy" in sample.available_metrics,
+                    metric_available,
+                )
+                self.assertIsNone(target.active_health_unhealthy)
+                self.assertEqual(target.active_health_status, "unknown")
+                self.assertIsNone(payload["active_health_unhealthy"])
+                self.assertEqual(payload["active_health_status"], "unknown")
+                self.assertEqual(target.route_status, "cooling_down")
+                self.assertEqual(target.status, "cooling_down")
+                self.assertEqual(WATCH.target_attempt_status_text(target, False), "冷却中 8.0s")
+                json.dumps(payload, allow_nan=False)
+
+    def test_active_health_partial_or_nonfinite_progress_does_not_invent_counts(self) -> None:
+        cases = [
+            ({"recovery_successes": 1}, "恢复确认 1/?"),
+            ({"recovery_successes": 1, "recovery_required_successes": 0}, "恢复确认 1/?"),
+            ({"recovery_successes": 1, "recovery_required_successes": "NaN"}, "恢复确认 1/?"),
+            ({"recovery_successes": "NaN", "recovery_required_successes": 2}, "主动检查未恢复"),
+            ({"recovery_successes": "+Inf", "recovery_required_successes": 2}, "主动检查未恢复"),
+            ({"recovery_required_successes": 2}, "主动检查未恢复"),
+        ]
+        for values, expected_text in cases:
+            with self.subTest(values=values):
+                sample = WATCH.parse_metrics(
+                    metrics_body() + attempt_metrics_body()
+                    + active_health_metrics_body(unhealthy=1, **values),
+                    200.0,
+                    200.0,
+                )
+                target = next(
+                    item for item in WATCH.build_attempt_window(sample, None).targets
+                    if item.target == "h2.example:443"
+                )
+
+                self.assertEqual(WATCH.target_attempt_status_text(target, False), expected_text)
+                payload = WATCH.target_attempt_to_dict(target, sample.wall_time)
+                json.dumps(payload, allow_nan=False)
+
+    def test_active_health_recovery_samples_require_all_route_labels(self) -> None:
+        for metric in WATCH.ACTIVE_HEALTH_RECOVERY_METRICS:
+            for missing in ("rule", "mode", "target"):
+                with self.subTest(metric=metric, missing=missing):
+                    labels = {"rule": "mixed", "mode": "boost", "target": "h2.example:443"}
+                    labels.pop(missing)
+                    encoded = ",".join(f'{key}="{value}"' for key, value in labels.items())
+                    with self.assertRaises(WATCH.WatchError):
+                        WATCH.parse_metrics(metrics_body() + f"{metric}{{{encoded}}} 1\n", 1.0, 100.0)
+
+    def test_active_health_confirmation_uses_same_table_rows_and_columns(self) -> None:
+        def render(recovery_body: str) -> str:
+            sample = WATCH.parse_metrics(
+                metrics_body() + attempt_metrics_body() + recovery_body, 200.0, 200.0
+            )
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                WATCH.print_attempt_window(WATCH.build_attempt_window(sample, None), sample, 120, False)
+            return output.getvalue()
+
+        before = render("")
+        after = render(active_health_metrics_body(
+            unhealthy=1, recovery_successes=1, recovery_required_successes=2,
+            probe_in_flight=1, next_probe_timestamp_seconds=205,
+        ))
+
+        self.assertEqual(len(before.splitlines()), len(after.splitlines()))
+        self.assertEqual(
+            [line.count("|") for line in before.splitlines()],
+            [line.count("|") for line in after.splitlines()],
+        )
+        self.assertIn("恢复确认 1/2", after)
+        self.assertNotIn("\x1b", after)
 
     def test_failed_target_is_kept_even_without_a_successful_tunnel_series(self) -> None:
         def failed_target_body(attempts: int, failures: int, last_attempt: int) -> str:

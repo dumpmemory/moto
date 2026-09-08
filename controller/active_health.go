@@ -20,6 +20,7 @@ const (
 	activeHealthMaxConcurrentProbes = 32
 	activeHealthJitterPercent       = 10
 	activeHealthMaxResponseHeaders  = 32 << 10
+	activeHealthRecoveryConfirmCap  = 1500 * time.Millisecond
 )
 
 // The slot pool is process-wide rather than per server generation. This keeps
@@ -36,6 +37,11 @@ type activeHealthState struct {
 	unhealthy            bool
 	consecutiveFailures  int
 	consecutiveSuccesses int
+	requiredSuccesses    int
+	nextProbeAt          time.Time
+	probeInFlight        bool
+	lastProbeSuccess     time.Time
+	lastRecovery         time.Time
 }
 
 type activeHealthJob struct {
@@ -65,6 +71,8 @@ type activeHealthManager struct {
 	probe        activeHealthProbeFunc
 	initialDelay activeHealthDelayFunc
 	nextDelay    activeHealthDelayFunc
+	now          func() time.Time
+	waitDelay    func(context.Context, time.Duration) bool
 }
 
 func newActiveHealthManager() *activeHealthManager {
@@ -73,6 +81,8 @@ func newActiveHealthManager() *activeHealthManager {
 		probe:        probeActiveHealthTarget,
 		initialDelay: activeHealthInitialDelay,
 		nextDelay:    activeHealthIntervalDelay,
+		now:          time.Now,
+		waitDelay:    waitActiveHealthDelay,
 	}
 }
 
@@ -134,6 +144,12 @@ func (manager *activeHealthManager) start(parent context.Context, rules []*confi
 		if manager.states[job.key] == nil {
 			manager.states[job.key] = &activeHealthState{}
 		}
+		state := manager.states[job.key]
+		state.requiredSuccesses = job.check.SuccessThreshold
+		// Reloads inherit confirmation evidence, but scheduling and probe
+		// capacity belong exclusively to the checker in this generation.
+		state.nextProbeAt = time.Time{}
+		state.probeInFlight = false
 	}
 	manager.mu.Unlock()
 	manager.wg.Add(len(jobs))
@@ -174,17 +190,43 @@ func (manager *activeHealthManager) unhealthy(rule *config.Rule, address string)
 
 func (manager *activeHealthManager) runChecker(ctx context.Context, job activeHealthJob) {
 	defer manager.wg.Done()
+	defer func() {
+		manager.mu.Lock()
+		if state := manager.states[job.key]; state != nil {
+			state.nextProbeAt = time.Time{}
+			state.probeInFlight = false
+		}
+		manager.mu.Unlock()
+	}()
 	interval := time.Duration(job.check.Interval) * time.Millisecond
 	delay := manager.initialDelay(interval)
 	for {
-		if !waitActiveHealthDelay(ctx, delay) {
+		manager.mu.Lock()
+		manager.states[job.key].nextProbeAt = manager.now().Add(max(delay, 0))
+		manager.mu.Unlock()
+		if !manager.waitDelay(ctx, delay) {
 			return
 		}
 		if !manager.runProbe(ctx, job) {
 			return
 		}
-		delay = manager.nextDelay(interval)
+		delay = manager.nextProbeDelay(job, interval)
 	}
+}
+
+// Only the second consecutive recovery confirmation gets a shorter base
+// interval. Healthy probes, failures, HTTP checks, and further confirmations
+// keep the configured cadence. The usual jitter still applies to either base.
+func (manager *activeHealthManager) nextProbeDelay(job activeHealthJob, interval time.Duration) time.Duration {
+	manager.mu.RLock()
+	state := manager.states[job.key]
+	confirmRecovery := job.check.Type == config.HealthCheckTCP && state != nil &&
+		state.unhealthy && state.consecutiveSuccesses == 1
+	manager.mu.RUnlock()
+	if confirmRecovery {
+		interval = min(interval, activeHealthRecoveryConfirmCap)
+	}
+	return manager.nextDelay(interval)
 }
 
 func waitActiveHealthDelay(ctx context.Context, delay time.Duration) bool {
@@ -202,17 +244,36 @@ func waitActiveHealthDelay(ctx context.Context, delay time.Duration) bool {
 }
 
 func (manager *activeHealthManager) runProbe(ctx context.Context, job activeHealthJob) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	select {
 	case activeHealthProbeSlots <- struct{}{}:
 	case <-ctx.Done():
 		return false
 	}
+	if ctx.Err() != nil {
+		<-activeHealthProbeSlots
+		return false
+	}
+	manager.mu.Lock()
+	state := manager.states[job.key]
+	if state == nil {
+		state = &activeHealthState{requiredSuccesses: job.check.SuccessThreshold}
+		manager.states[job.key] = state
+	}
+	state.nextProbeAt = time.Time{}
+	state.probeInFlight = true
+	manager.mu.Unlock()
 
 	timeout := time.Duration(job.check.Timeout) * time.Millisecond
 	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	err := manager.probe(probeCtx, job.target, job.check, job.proxyProtocol)
 	parentCanceled := ctx.Err() != nil
 	cancel()
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	state.probeInFlight = false
 	<-activeHealthProbeSlots
 	if parentCanceled {
 		return false
@@ -222,7 +283,11 @@ func (manager *activeHealthManager) runProbe(ctx context.Context, job activeHeal
 	// usable during a TCP outage. Keep the target eligible and let real H3/H2
 	// CONNECT attempts update passive route health instead.
 	if err == nil || job.failureConclusive {
-		manager.observe(job.key, job.check, err == nil)
+		manager.observeLocked(state, job.check, err == nil)
+	} else {
+		// An inconclusive TCP failure cannot mark an H3 target unhealthy, but
+		// it also cannot count toward consecutive successful confirmations.
+		state.consecutiveSuccesses = 0
 	}
 	return true
 }
@@ -248,7 +313,14 @@ func (manager *activeHealthManager) observe(key activeHealthKey, check config.He
 		state = &activeHealthState{}
 		manager.states[key] = state
 	}
+	manager.observeLocked(state, check, success)
+}
+
+func (manager *activeHealthManager) observeLocked(state *activeHealthState, check config.HealthCheckConfig, success bool) {
+	state.requiredSuccesses = check.SuccessThreshold
 	if success {
+		now := manager.now()
+		state.lastProbeSuccess = now
 		state.consecutiveFailures = 0
 		if !state.unhealthy {
 			state.consecutiveSuccesses = 0
@@ -258,6 +330,7 @@ func (manager *activeHealthManager) observe(key activeHealthKey, check config.He
 		if state.consecutiveSuccesses >= check.SuccessThreshold {
 			state.unhealthy = false
 			state.consecutiveSuccesses = 0
+			state.lastRecovery = now
 		}
 		return
 	}
