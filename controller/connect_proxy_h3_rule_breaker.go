@@ -110,6 +110,7 @@ type http3RuleBreakerState struct {
 	retryAt                  time.Time
 	recent                   []http3RuleDegradationEvent
 	probation                http3RuleProbationState
+	lastRecovery             http3RuleRecoveryResult
 	evaluationToken          uint64
 	evaluationInFlight       int
 	evaluationReachable      bool
@@ -317,7 +318,7 @@ func (breaker *http3RuleBreaker) releaseRecoveryRouteProbe(rule string, token ui
 		return false
 	}
 	breaker.mu.Lock()
-	defer breaker.mu.Unlock()
+	var result http3RuleRecoveryResult
 	state := breaker.rules[rule]
 	if state != nil && state.routeProbeToken == token {
 		state.routeProbeToken = 0
@@ -328,6 +329,11 @@ func (breaker *http3RuleBreaker) releaseRecoveryRouteProbe(rule string, token ui
 		// claim refresh to stable H2-safe penalties instead of admitting H3-only.
 		state.retryAt = breaker.now().Add(http3RuleProbationAbortDelay)
 		state.events["probation_aborted"]++
+		result = state.finishRecoveryLocked(breaker.now(), "no_network", true)
+	}
+	breaker.mu.Unlock()
+	if result.result != "" {
+		logHTTP3RecoveryResult("HTTP/3 规则级恢复探测未触达网络，稍后重试", rule, "no_network", http3RuleProbationAbortDelay, result)
 	}
 	return true
 }
@@ -363,10 +369,14 @@ func (manager *connectProxyManager) establishHTTP3RuleProbation(
 	if !manager.h3RuleBreaker.establish(rule, token, key, binding) {
 		return connection
 	}
+	var finalEvidence *http3RuleSampleEvent
 	return &http3RuleProbationConn{
 		Conn: connection,
+		beforeClose: func() {
+			finalEvidence = manager.snapshotHTTP3RuleProbation(rule, token)
+		},
 		onClose: func() {
-			manager.failHTTP3RuleProbation(rule, token, "insufficient_evidence")
+			manager.h3RuleBreaker.failProbationWithEvidence(rule, token, "probe_closed", finalEvidence)
 		},
 	}
 }
@@ -417,6 +427,7 @@ func (breaker *http3RuleBreaker) abortProbation(rule string, token uint64, reaso
 		breaker.mu.Unlock()
 		return
 	}
+	result := state.finishRecoveryLocked(breaker.now(), reason, true)
 	state.phase = http3RuleBreakerCooldown
 	state.retryAt = breaker.now().Add(http3RuleProbationAbortDelay)
 	state.probation = http3RuleProbationState{}
@@ -430,10 +441,7 @@ func (breaker *http3RuleBreaker) abortProbation(rule string, token uint64, reaso
 	state.routeProbeKey = http3ConnectTransportKey{}
 	state.events["probation_aborted"]++
 	breaker.mu.Unlock()
-	utils.Logger.Info("HTTP/3 规则级恢复探测未触达网络，稍后重试",
-		zap.String("ruleName", rule),
-		zap.String("reason", reason),
-		zap.Duration("retryAfter", http3RuleProbationAbortDelay))
+	logHTTP3RecoveryResult("HTTP/3 规则级恢复探测已中止，稍后重试", rule, reason, http3RuleProbationAbortDelay, result)
 }
 
 func (manager *connectProxyManager) observeHTTP3RuleValidation(
@@ -570,6 +578,10 @@ func (breaker *http3RuleBreaker) expireEvaluationLocked(state *http3RuleBreakerS
 }
 
 func (breaker *http3RuleBreaker) failProbation(rule string, token uint64, reason string) {
+	breaker.failProbationWithEvidence(rule, token, reason, nil)
+}
+
+func (breaker *http3RuleBreaker) failProbationWithEvidence(rule string, token uint64, reason string, evidence *http3RuleSampleEvent) {
 	if breaker == nil || rule == "" || token == 0 {
 		return
 	}
@@ -579,13 +591,22 @@ func (breaker *http3RuleBreaker) failProbation(rule string, token uint64, reason
 		breaker.mu.Unlock()
 		return
 	}
+	if evidence != nil && state.probation.established && state.probation.key == evidence.key &&
+		state.probation.generationID == evidence.generationID {
+		state.probation.updateEvidence(*evidence)
+		if evidence.connectionErr != nil || evidence.decision.Rotate {
+			reason = "transport_degraded"
+			state.probation.healthySamples = 0
+		}
+	}
+	result := state.finishRecoveryLocked(breaker.now(), reason, false)
 	delay := breaker.reenterCooldownLocked(state)
 	state.events["probation_failed"]++
 	breaker.mu.Unlock()
-	utils.Logger.Warn("HTTP/3 规则级恢复探测未通过，继续使用 HTTP/2",
-		zap.String("ruleName", rule),
-		zap.String("reason", reason),
-		zap.Duration("retryAfter", delay))
+	if reason == "probe_closed" {
+		reason = "insufficient_evidence"
+	}
+	logHTTP3RecoveryResult("HTTP/3 规则级恢复探测未通过，继续使用 HTTP/2", rule, reason, delay, result)
 }
 
 func (breaker *http3RuleBreaker) reenterCooldownLocked(state *http3RuleBreakerState) time.Duration {
@@ -644,6 +665,7 @@ func (breaker *http3RuleBreaker) noteDegradation(event http3RuleDegradationEvent
 		name       string
 		delay      time.Duration
 		evaluating bool
+		result     http3RuleRecoveryResult
 	}
 	var opened []openedRule
 	breaker.mu.Lock()
@@ -655,9 +677,11 @@ func (breaker *http3RuleBreaker) noteDegradation(event http3RuleDegradationEvent
 		breaker.expireEvaluationLocked(state, event.at)
 		if state.phase == http3RuleBreakerProbation && state.probation.generationID == event.generationID &&
 			state.probation.key == event.key {
+			state.probation.healthySamples = 0
+			result := state.finishRecoveryLocked(event.at, "transport_degraded", false)
 			delay := breaker.reenterCooldownLocked(state)
 			state.events["probation_failed"]++
-			opened = append(opened, openedRule{name: rule, delay: delay})
+			opened = append(opened, openedRule{name: rule, delay: delay, result: result})
 			continue
 		}
 		if state.phase != http3RuleBreakerClosed {
@@ -713,12 +737,14 @@ func (breaker *http3RuleBreaker) noteDegradation(event http3RuleDegradationEvent
 			continue
 		}
 		openedRules = append(openedRules, transition.name)
-		utils.Logger.Warn("检测到规则级 HTTP/3 路径持续退化，新连接暂时使用 HTTP/2",
+		fields := []zap.Field{
 			zap.String("ruleName", transition.name),
 			zap.String("targetAddr", event.key.address),
 			zap.String("remoteIP", event.remoteIP),
 			zap.String("reason", string(event.reason)),
-			zap.Duration("retryAfter", transition.delay))
+			zap.Duration("retryAfter", transition.delay),
+		}
+		utils.Logger.Warn("检测到规则级 HTTP/3 路径持续退化，新连接暂时使用 HTTP/2", append(fields, transition.result.fields()...)...)
 	}
 	return openedRules
 }
@@ -782,11 +808,16 @@ func (breaker *http3RuleBreaker) noteSample(event http3RuleSampleEvent) {
 	if event.at.IsZero() {
 		event.at = breaker.now()
 	}
-	var recovered []string
+	type recoveredRule struct {
+		name   string
+		result http3RuleRecoveryResult
+	}
+	var recovered []recoveredRule
 	type failedRule struct {
 		name   string
 		delay  time.Duration
 		reason string
+		result http3RuleRecoveryResult
 	}
 	var failed []failedRule
 	breaker.mu.Lock()
@@ -797,17 +828,14 @@ func (breaker *http3RuleBreaker) noteSample(event http3RuleSampleEvent) {
 			continue
 		}
 		probe := &state.probation
+		probe.updateEvidence(event)
 		if event.connectionErr != nil || event.decision.Rotate {
+			probe.healthySamples = 0
+			result := state.finishRecoveryLocked(event.at, "transport_degraded", false)
 			delay := breaker.reenterCooldownLocked(state)
 			state.events["probation_failed"]++
-			failed = append(failed, failedRule{name: rule, delay: delay, reason: "transport_degraded"})
+			failed = append(failed, failedRule{name: rule, delay: delay, reason: "transport_degraded", result: result})
 			continue
-		}
-		if event.payloadBytes >= probe.initialPayload {
-			probe.payloadBytes = event.payloadBytes - probe.initialPayload
-		}
-		if event.stats.PacketsSent >= probe.initialStats.PacketsSent {
-			probe.packetsSent = event.stats.PacketsSent - probe.initialStats.PacketsSent
 		}
 		signals := event.decision.Signals
 		// The transport sampler may wake a fraction before the minimum interval.
@@ -829,6 +857,7 @@ func (breaker *http3RuleBreaker) noteSample(event http3RuleSampleEvent) {
 		elapsed := event.at.Sub(probe.establishedAt)
 		enoughData := probe.payloadBytes >= http3RuleProbationMinPayload || probe.packetsSent >= http3RuleProbationMinPackets
 		if elapsed >= http3RuleProbationMinDuration && enoughData && probe.healthySamples >= http3RuleProbationHealthyCount {
+			result := state.finishRecoveryLocked(event.at, "recovered", false)
 			state.phase = http3RuleBreakerClosed
 			state.failures = 0
 			state.retryAt = time.Time{}
@@ -843,25 +872,22 @@ func (breaker *http3RuleBreaker) noteSample(event http3RuleSampleEvent) {
 			state.routeProbeToken = 0
 			state.routeProbeKey = http3ConnectTransportKey{}
 			state.events["recovered"]++
-			recovered = append(recovered, rule)
+			recovered = append(recovered, recoveredRule{name: rule, result: result})
 			continue
 		}
 		if elapsed >= http3RuleProbationMaxDuration {
+			result := state.finishRecoveryLocked(event.at, "observation_timeout", false)
 			delay := breaker.reenterCooldownLocked(state)
 			state.events["probation_failed"]++
-			failed = append(failed, failedRule{name: rule, delay: delay, reason: "insufficient_evidence"})
+			failed = append(failed, failedRule{name: rule, delay: delay, reason: "insufficient_evidence", result: result})
 		}
 	}
 	breaker.mu.Unlock()
-	for _, rule := range recovered {
-		utils.Logger.Info("HTTP/3 规则级数据面验证通过，恢复新连接使用 HTTP/3",
-			zap.String("ruleName", rule))
+	for _, transition := range recovered {
+		logHTTP3RecoveryResult("HTTP/3 规则级数据面验证通过，恢复新连接使用 HTTP/3", transition.name, "", 0, transition.result)
 	}
 	for _, transition := range failed {
-		utils.Logger.Warn("HTTP/3 规则级数据面验证未通过，继续使用 HTTP/2",
-			zap.String("ruleName", transition.name),
-			zap.String("reason", transition.reason),
-			zap.Duration("retryAfter", transition.delay))
+		logHTTP3RecoveryResult("HTTP/3 规则级数据面验证未通过，继续使用 HTTP/2", transition.name, transition.reason, transition.delay, transition.result)
 	}
 }
 
@@ -974,14 +1000,21 @@ func http3RemoteIP(address net.Addr) string {
 
 type http3RuleProbationConn struct {
 	net.Conn
-	closeOnce sync.Once
-	onClose   func()
+	closeOnce    sync.Once
+	snapshotOnce sync.Once
+	beforeClose  func()
+	onClose      func()
 }
 
 func (conn *http3RuleProbationConn) Close() error {
 	if conn == nil || conn.Conn == nil {
 		return nil
 	}
+	conn.snapshotOnce.Do(func() {
+		if conn.beforeClose != nil {
+			conn.beforeClose()
+		}
+	})
 	err := conn.Conn.Close()
 	conn.closeOnce.Do(func() {
 		if conn.onClose != nil {
@@ -1013,6 +1046,7 @@ type http3RuleBreakerGauge struct {
 	healthySamples int
 	payloadBytes   uint64
 	packetsSent    uint64
+	lastRecovery   http3RuleRecoveryResult
 	events         map[string]uint64
 }
 
@@ -1040,6 +1074,7 @@ func (breaker *http3RuleBreaker) snapshot() []http3RuleBreakerGauge {
 			healthySamples: state.probation.healthySamples,
 			payloadBytes:   state.probation.payloadBytes,
 			packetsSent:    state.probation.packetsSent,
+			lastRecovery:   state.lastRecovery,
 			events:         make(map[string]uint64, len(state.events)),
 		}
 		if gauge.cooldown && now.Before(state.retryAt) {

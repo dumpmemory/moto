@@ -82,6 +82,7 @@ type http3PolicyGauge struct {
 
 type http3GaugeSnapshot struct {
 	transports   []http3TransportGauge
+	closures     []http3ConnectionCloseGauge
 	rotations    []http3RotationGauge
 	policies     []http3PolicyGauge
 	ruleBreakers []http3RuleBreakerGauge
@@ -213,6 +214,7 @@ func (runtime *routingRuntime) renderOperationalGauges(output *strings.Builder) 
 		writeMetricSample(output, "moto_dial_bulkhead_target_in_flight", []prometheusLabel{{"target", target}}, strconv.Itoa(dialCapacity.ActiveByTarget[target]))
 	}
 
+	renderHTTP3CloseMetrics(output, http3.closures)
 	writeMetricHeader(output, "moto_connect_proxy_h3_transports", "Physical HTTP/3 transports in the current routing generation by configured proxy target and state.", "gauge")
 	for _, transport := range http3.transports {
 		writeMetricSample(output, "moto_connect_proxy_h3_transports", http3TransportGaugeLabels(transport), strconv.Itoa(transport.transports))
@@ -328,6 +330,7 @@ func (runtime *routingRuntime) renderOperationalGauges(output *strings.Builder) 
 			writeMetricSample(output, "moto_connect_proxy_h3_rule_breaker_events", []prometheusLabel{{"rule", rule.rule}, {"outcome", outcome}}, strconv.FormatUint(rule.events[outcome], 10))
 		}
 	}
+	writeHTTP3RecoveryGauges(output, http3.ruleBreakers)
 }
 
 func snapshotHTTP3Gauges(manager *connectProxyManager) http3GaugeSnapshot {
@@ -438,6 +441,9 @@ func (manager *http3ConnectManager) snapshotGauges() http3GaugeSnapshot {
 		transports: make([]http3TransportGauge, 0, len(aggregates)),
 		rotations:  make([]http3RotationGauge, 0, len(manager.rotationEvents)),
 	}
+	for key, count := range manager.closeEvents {
+		snapshot.closures = append(snapshot.closures, http3ConnectionCloseGauge{target: key.target, reason: key.reason, count: count})
+	}
 	for _, aggregate := range aggregates {
 		snapshot.transports = append(snapshot.transports, *aggregate)
 	}
@@ -461,6 +467,7 @@ func (manager *http3ConnectManager) snapshotGauges() http3GaugeSnapshot {
 		}
 		return left.health < right.health
 	})
+	sortHTTP3CloseMetrics(snapshot.closures)
 	sort.Slice(snapshot.rotations, func(i, j int) bool {
 		left, right := snapshot.rotations[i], snapshot.rotations[j]
 		if left.target != right.target {

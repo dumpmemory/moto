@@ -83,12 +83,46 @@ H3_RULE_METRICS = {
     "moto_connect_proxy_h3_rule_probation_payload_bytes": "probation_payload_bytes",
     "moto_connect_proxy_h3_rule_probation_packets_sent": "probation_packets_sent",
 }
+H3_RECOVERY_PREFIX = "moto_connect_proxy_h3_rule_recovery"
+H3_RECOVERY_RESULT_METRIC = H3_RECOVERY_PREFIX + "_last_result"
+H3_RECOVERY_REQUIREMENT_METRIC = H3_RECOVERY_PREFIX + "_last_requirement_met"
+H3_RECOVERY_VALUE_METRICS = {
+    H3_RECOVERY_PREFIX + "_" + name: name
+    for name in (
+        "last_timestamp_seconds", "last_elapsed_seconds", "last_payload_bytes",
+        "last_packets_sent", "last_healthy_samples", "min_duration_seconds",
+        "max_duration_seconds", "min_payload_bytes", "min_packets_sent",
+        "min_healthy_samples",
+    )
+}
+H3_RECOVERY_RESULTS = {
+    "recovered": "验证通过", "insufficient_evidence": "证据不足",
+    "transport_degraded": "传输退化", "setup_failed": "连接建立失败",
+    "aborted": "探测已中止", "unknown": "结果未知",
+}
+H3_RECOVERY_REASONS = {
+    "recovered": "恢复条件已满足", "probe_closed": "探测隧道提前结束",
+    "observation_timeout": "观察期限已到", "transport_degraded": "传输出现退化信号",
+    "missing_transport_evidence": "缺少传输采样证据", "setup_failed": "连接未建立",
+    "canceled": "请求已取消", "capacity": "本地容量不足",
+    "protocol_unavailable": "协议暂不可用", "target_cooldown": "目标仍在冷却",
+    "no_network": "未进行网络尝试", "unknown": "原因未知",
+}
+H3_RECOVERY_REQUIREMENTS = {
+    "duration": "观察时长不足", "data": "数据量不足",
+    "healthy_samples": "健康样本不足",
+}
+H3_RECOVERY_METRICS = (
+    H3_RECOVERY_RESULT_METRIC, H3_RECOVERY_REQUIREMENT_METRIC,
+    *H3_RECOVERY_VALUE_METRICS,
+)
 H3_ROTATION_METRIC = "moto_connect_proxy_h3_rotation_events"
 H3_RULE_EVENT_METRIC = "moto_connect_proxy_h3_rule_breaker_events"
 OPTIONAL_METRICS = tuple(
     list(H3_TRANSPORT_METRICS)
     + list(H3_TARGET_METRICS)
     + list(H3_RULE_METRICS)
+    + list(H3_RECOVERY_METRICS)
     + list(ROUTE_ATTEMPT_METRICS)
     + list(DIAL_ATTEMPT_METRICS)
     + [H3_ROTATION_METRIC, H3_RULE_EVENT_METRIC]
@@ -127,6 +161,7 @@ class Sample:
     h3_transport: Dict[H3TransportKey, Dict[str, float]] = field(default_factory=dict)
     h3_target: Dict[str, Dict[str, float]] = field(default_factory=dict)
     h3_rule: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    h3_recovery: Dict[str, Dict[str, object]] = field(default_factory=dict)
     h3_rotations: Dict[H3RotationKey, float] = field(default_factory=dict)
     h3_rule_events: Dict[H3RuleEventKey, float] = field(default_factory=dict)
     route_attempts: Dict[RouteAttemptKey, Dict[str, float]] = field(default_factory=dict)
@@ -175,6 +210,7 @@ class H3HealthView:
     rule_breaker_events: int
     rule_breaker_details: Dict[str, int]
     signals_sampled: bool
+    rule_last_recovery: Optional[Dict[str, object]] = None
 
 
 @dataclass
@@ -517,6 +553,8 @@ def parse_metrics(body: str, monotonic_time: float, wall_time: float) -> Sample:
         value = finite_metric_value(raw_value, metric)
         if value is None:
             continue
+        if metric in H3_RECOVERY_METRICS and value < 0:
+            continue
         value = max(0.0, value)
 
         if metric in REQUIRED_METRICS:
@@ -547,6 +585,28 @@ def parse_metrics(body: str, monotonic_time: float, wall_time: float) -> Sample:
             rule = required_label(labels, metric, "rule")
             values = sample.h3_rule.setdefault(rule, {})
             values[H3_RULE_METRICS[metric]] = value
+        elif metric in H3_RECOVERY_METRICS:
+            rule = required_label(labels, metric, "rule")
+            recovery = sample.h3_recovery.setdefault(rule, {})
+            if metric == H3_RECOVERY_RESULT_METRIC:
+                if value != 1:
+                    continue
+                result = required_label(labels, metric, "result")
+                reason = required_label(labels, metric, "reason")
+                # Only fixed exporter enums reach JSON or the terminal. Future
+                # or malformed values are not error text and must not be echoed.
+                if "result" in recovery:
+                    recovery["result"] = "unknown"
+                    recovery["reason"] = "unknown"
+                else:
+                    recovery["result"] = result if result in H3_RECOVERY_RESULTS else "unknown"
+                    recovery["reason"] = reason if reason in H3_RECOVERY_REASONS else "unknown"
+            elif metric == H3_RECOVERY_REQUIREMENT_METRIC:
+                requirement = required_label(labels, metric, "requirement")
+                if requirement in H3_RECOVERY_REQUIREMENTS and value in (0, 1):
+                    recovery["requirement_" + requirement] = value == 1
+            else:
+                recovery[H3_RECOVERY_VALUE_METRICS[metric]] = value
         elif metric == H3_ROTATION_METRIC:
             rotation_key = (
                 required_label(labels, metric, "target"),
@@ -954,6 +1014,58 @@ def boolean_metric(values: Mapping[str, float], name: str) -> bool:
     return values.get(name, 0.0) >= 0.5
 
 
+def h3_last_recovery(current: Sample, rule: str) -> Optional[Dict[str, object]]:
+    values = current.h3_recovery.get(rule, {})
+    if "result" not in values:
+        return None
+
+    def number(name: str) -> Optional[float]:
+        value = values.get(name)
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            return None
+        if name.startswith("min_") or name == "max_duration_seconds":
+            if value <= 0:
+                return None
+        return round(float(value), 6)
+
+    def count(name: str) -> Optional[int]:
+        value = number(name)
+        return int(value) if value is not None and value.is_integer() else None
+
+    requirements = {
+        name: values.get("requirement_" + name)
+        for name in H3_RECOVERY_REQUIREMENTS
+    }
+    return {
+        "result": values["result"],
+        "reason": values["reason"],
+        "timestamp_seconds": number("last_timestamp_seconds"),
+        "elapsed_seconds": number("last_elapsed_seconds"),
+        "payload_bytes": count("last_payload_bytes"),
+        "packets_sent": count("last_packets_sent"),
+        "healthy_samples": count("last_healthy_samples"),
+        "requirements_met": requirements,
+        "requirements_missing": [name for name, met in requirements.items() if met is False],
+        "requirements_unknown": [name for name, met in requirements.items() if met is None],
+        "thresholds": {
+            "min_duration_seconds": number("min_duration_seconds"),
+            "max_duration_seconds": number("max_duration_seconds"),
+            "min_payload_bytes": count("min_payload_bytes"),
+            "min_packets_sent": count("min_packets_sent"),
+            "min_healthy_samples": count("min_healthy_samples"),
+        },
+    }
+
+
+def h3_last_recoveries(current: Sample) -> Dict[str, Dict[str, object]]:
+    results = {}
+    for rule in sorted(current.h3_recovery):
+        recovery = h3_last_recovery(current, rule)
+        if recovery is not None:
+            results[rule] = recovery
+    return results
+
+
 def h3_event_deltas(
     current: Sample,
     event_baseline: Optional[Sample],
@@ -1006,11 +1118,13 @@ def aggregate_h3_health(
     ]
     target_values = current.h3_target.get(target, {})
     rule_values = current.h3_rule.get(rule, {})
+    last_recovery = h3_last_recovery(current, rule)
     optional_supported = any(metric in current.available_metrics for metric in OPTIONAL_METRICS)
     if (
         not groups
         and not target_values
         and not rule_values
+        and last_recovery is None
         and (protocol != "h3" or not optional_supported)
     ):
         return None
@@ -1221,6 +1335,7 @@ def aggregate_h3_health(
         rule_breaker_events=rule_breaker_events,
         rule_breaker_details=rule_breaker_details,
         signals_sampled=signals_sampled,
+        rule_last_recovery=last_recovery,
     )
 
 
@@ -1454,6 +1569,7 @@ def h3_health_to_dict(health: H3HealthView) -> Dict[str, object]:
         "rule_probation_healthy_samples": health.rule_probation_healthy_samples,
         "rule_probation_payload_bytes": health.rule_probation_payload_bytes,
         "rule_probation_packets_sent": health.rule_probation_packets_sent,
+        "rule_last_recovery": health.rule_last_recovery,
     }
 
 
@@ -1759,6 +1875,9 @@ def snapshot_dict(
             "targets": target_events,
             "rules": rule_events,
         },
+        # Rule results survive even when every visible route has closed. These
+        # are exporter snapshots, not locally cached data from a previous run.
+        "h3_last_recovery_by_rule": h3_last_recoveries(sample),
         "recent_target_attempts": attempt_window_to_dict(
             attempts,
             sample.wall_time,
@@ -1883,6 +2002,27 @@ def h3_status_text(status: str, color: bool) -> str:
     return painter(label, color)
 
 
+def h3_recovery_summary(recovery: Mapping[str, object]) -> str:
+    result = recovery.get("result")
+    reason = recovery.get("reason")
+    label = H3_RECOVERY_RESULTS.get(result, H3_RECOVERY_RESULTS["unknown"])
+    explanation = H3_RECOVERY_REASONS.get(reason, H3_RECOVERY_REASONS["unknown"])
+    requirements = recovery.get("requirements_met", {})
+    missing = [
+        text for name, text in H3_RECOVERY_REQUIREMENTS.items()
+        if requirements.get(name) is False
+    ]
+    if result == "insufficient_evidence" and missing:
+        label += "：" + "、".join(missing)
+    summary = f"{label}（{explanation}）"
+    if result == "insufficient_evidence" and not missing:
+        summary += "；具体缺项未提供"
+
+    # Keep the terminal line short; complete measurements and thresholds are
+    # available in JSON and Moto's event log without changing table layout.
+    return summary
+
+
 def print_h3_health(health: H3HealthView, color: bool) -> None:
     states = ", ".join(
         f"{state}={count}"
@@ -1954,6 +2094,8 @@ def print_h3_health(health: H3HealthView, color: bool) -> None:
         else:
             policy_text = cyan(policy_text, color)
         print("H3 策略: " + policy_text)
+    if health.rule_last_recovery is not None:
+        print("H3 最近恢复: " + h3_recovery_summary(health.rule_last_recovery))
     if health.rotation_events or health.rule_breaker_events:
         print(
             "H3 事件: "
@@ -2013,6 +2155,14 @@ def print_human(
             print_h3_health(dominant.h3_health, color)
     elif view.state == "no_active_tunnels":
         print("当前没有活动的 H2/H3 隧道。")
+
+    # Keep results available during quiet cooldown periods and for other rules
+    # without repeating the dominant rule's result already printed above.
+    dominant_rule = selection.dominant.key[0] if selection.dominant else None
+    for rule, recovery in h3_last_recoveries(sample).items():
+        if rule != dominant_rule:
+            rule_label = "".join(char for char in rule if char.isprintable())
+            print(f"H3 最近恢复 [{rule_label}]: " + h3_recovery_summary(recovery))
 
     if selection.pending is not None:
         pending = route_lookup(view.routes).get(selection.pending)
