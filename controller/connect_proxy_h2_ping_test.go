@@ -112,16 +112,17 @@ type http2PingTestProxy struct {
 	roots    *x509.CertPool
 	ackDelay time.Duration
 
-	accepted         atomic.Uint64
-	dropFirstPingACK atomic.Bool
-	pings            chan uint64
-	droppedPings     chan uint64
-	closed           chan uint64
-	stop             chan struct{}
-	acceptDone       chan struct{}
-	workers          sync.WaitGroup
-	mu               sync.Mutex
-	connections      map[net.Conn]struct{}
+	accepted           atomic.Uint64
+	dropFirstPingACK   atomic.Bool
+	dropPingACKThrough atomic.Uint64
+	pings              chan uint64
+	droppedPings       chan uint64
+	closed             chan uint64
+	stop               chan struct{}
+	acceptDone         chan struct{}
+	workers            sync.WaitGroup
+	mu                 sync.Mutex
+	connections        map[net.Conn]struct{}
 }
 
 func newHTTP2PingTestProxy(t *testing.T, ackDelay time.Duration) *http2PingTestProxy {
@@ -250,7 +251,7 @@ func (proxy *http2PingTestProxy) serve(t *testing.T, connection net.Conn, id uin
 			case <-proxy.stop:
 				return
 			}
-			if id == 1 && proxy.dropFirstPingACK.Load() {
+			if id == 1 && proxy.dropFirstPingACK.Load() || id <= proxy.dropPingACKThrough.Load() {
 				select {
 				case proxy.droppedPings <- id:
 				case <-proxy.stop:

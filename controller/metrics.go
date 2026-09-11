@@ -617,7 +617,9 @@ func metricConnectProxyHandshakeRecorder(rule, target, protocol string) func(str
 
 // x/net exposes health-PING loss at transport level, without the originating
 // physical connection or rule. H2 transports can be shared by several rules,
-// so count once by configured proxy target, never once per affected stream.
+// so aggregate by configured proxy target, never once per affected stream.
+// The H2 connection pool binds this sink through a physical-connection observer
+// that removes duplicate notifications and callbacks after normal termination.
 // The callback includes PING errors as well as timeouts; do not call it a
 // timeout-only counter. Unrelated CountError values are intentionally ignored.
 func metricConnectProxyH2ErrorCounter(target string) func(string) {
@@ -1027,7 +1029,7 @@ func renderPrometheusMetrics(renderGauges ...func(*strings.Builder)) string {
 		writeMetricSample(&output, "moto_connect_proxy_handshakes_total", labels, strconv.FormatUint(snapshot.connectProxyHandshakes[key], 10))
 	}
 
-	writeMetricHeader(&output, "moto_connect_proxy_h2_ping_failures_total", "Physical H2 connections closed after a failed health PING, including timeouts; shared across rules by configured target.", "counter")
+	writeMetricHeader(&output, "moto_connect_proxy_h2_ping_failures_total", "Physical H2 connections closed after a failed health PING, including timeouts; counted once per connection and shared across rules by configured target.", "counter")
 	for _, target := range sortedStringKeys(snapshot.connectProxyH2PingFailures) {
 		labels := []prometheusLabel{{"target", target}, {"protocol", config.ConnectProxyH2}}
 		writeMetricSample(&output, "moto_connect_proxy_h2_ping_failures_total", labels, strconv.FormatUint(snapshot.connectProxyH2PingFailures[target], 10))

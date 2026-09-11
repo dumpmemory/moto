@@ -97,6 +97,7 @@ func TestHTTP2PhysicalMetricsAcrossSharedRulesAndPingTimeout(t *testing.T) {
 	if got := processMetrics.snapshot().connectProxyH2PingFailures[address]; got != 1 {
 		t.Fatalf("PING failures across %d affected streams = %d, want one physical failure", len(tunnels), got)
 	}
+	assertHTTP2PingFailureCountSettled(t, address, 1)
 	processMetrics.unregisterRules(firstRules)
 	recoveryCtx, cancelRecovery := context.WithTimeout(withConnectProxyRuleName(context.Background(), "reusing-rule"), 3*time.Second)
 	defer cancelRecovery()
@@ -112,7 +113,7 @@ func TestHTTP2PhysicalMetricsAcrossSharedRulesAndPingTimeout(t *testing.T) {
 		t.Fatalf("recovery handshakes = %#v; physical connections = %d", snapshot.connectProxyHandshakes, proxy.accepted.Load())
 	}
 	if snapshot.connectProxyH2PingFailures[address] != 1 {
-		t.Fatal("retiring the initiating rule reset the shared target PING counter")
+		t.Fatalf("shared target PING counter after rule retirement = %d, want 1", snapshot.connectProxyH2PingFailures[address])
 	}
 }
 

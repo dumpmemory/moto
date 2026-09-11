@@ -109,7 +109,7 @@ func newHTTP2ConnectManager(factory func(http2ConnectTransportKey) *xhttp2.Trans
 
 func newHTTP2ConnectTransport(key http2ConnectTransportKey) *xhttp2.Transport {
 	profile := key.tlsProfile
-	return &xhttp2.Transport{
+	transport := &xhttp2.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			ServerName: key.serverName,
@@ -130,6 +130,10 @@ func newHTTP2ConnectTransport(key http2ConnectTransportKey) *xhttp2.Transport {
 		PingTimeout:       http2ConnectPingTimeout,
 		MaxHeaderListSize: http2ConnectMaxResponseHeaders,
 	}
+	// Per-connection transports keep CountError attribution separate while the
+	// outer transport retains HTTP/2 request handling and retry behavior.
+	transport.ConnPool = newHTTP2ConnectConnPool(transport)
+	return transport
 }
 
 // dialHTTP2TLS changes only the outer TLS ClientHello. HTTP/2 framing,
@@ -252,7 +256,7 @@ func (manager *http2ConnectManager) releaseTransport(key http2ConnectTransportKe
 	}
 	manager.mu.Unlock()
 	if closeTransport != nil {
-		closeTransport.CloseIdleConnections()
+		closeHTTP2ConnectIdleConnections(closeTransport)
 	}
 }
 
@@ -394,7 +398,7 @@ func (manager *http2ConnectManager) retire() {
 	}
 	manager.mu.Unlock()
 	for _, transport := range transports {
-		transport.CloseIdleConnections()
+		closeHTTP2ConnectIdleConnections(transport)
 	}
 }
 
@@ -406,8 +410,18 @@ func (manager *http2ConnectManager) closeIdle() {
 	}
 	manager.mu.Unlock()
 	for _, transport := range transports {
-		transport.CloseIdleConnections()
+		closeHTTP2ConnectIdleConnections(transport)
 	}
+}
+
+func closeHTTP2ConnectIdleConnections(transport *xhttp2.Transport) {
+	if pool, ok := transport.ConnPool.(*http2ConnectConnPool); ok {
+		// x/net's optional idle-closer interface uses a package-private method,
+		// so a pool implemented here must be closed explicitly by its manager.
+		pool.closeIdleConnections()
+		return
+	}
+	transport.CloseIdleConnections()
 }
 
 type tunnelAddr struct {
